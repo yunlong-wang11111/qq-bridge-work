@@ -1465,11 +1465,7 @@ async function main() {
       const ms = [...t.matchAll(/dsh web: http:\/\/127\.0\.0\.1:3080\/\?token=([A-Za-z0-9_-]+)/g)];
       if (ms.length) token = ms[ms.length - 1][1];
     } catch {}
-    let vip = '';
-    for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
-      if (!/star|vpn/i.test(name)) continue;
-      for (const a of addrs || []) if (a.family === 'IPv4' && !a.internal) { vip = a.address; break; }
-    }
+    const vip = pickRemoteHost();
     let { ok: relayOk, conflict: relayConflict } = await relayStatus(dshHome);
     if (!relayOk && !relayConflict) {
       try {
@@ -4402,7 +4398,7 @@ async function main() {
           }
           const sendCfg = cfg.socialV2?.send ?? {};
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
-          if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
+          // 超长不再拒收：下面拆条发送（通知内容常超 500 字，拒收等于丢信息）
           // owner 私聊（本机自动化通知，如 python-manager 任务完成推送）放行敏感词：
           // 通知内容含本机工作区路径是必要信息，且接收者是 owner 自己，不存在泄露风险
           const isOwnerSelf = key === `private:${cfg.ownerQQ}`;
@@ -4423,19 +4419,25 @@ async function main() {
             // 2026-09-11：owner 自通知（quest/python-manager 等用 console-token 推送）走专用直发通道，
             // 不排共享 sendChain——否则会被 AI 的长回复（切多条+间隔 300ms+单条 15s 超时）堵住，
             // 排队超过调用方 5s 超时即被丢弃（今天 11:01/11:23 两条实验通知就是这么丢的）。
+            // 拆条：超过单条上限就切成多条依次发（首条带引用）
+            const parts = message.length > maxChars ? splitForQQ(message, 4000) : [message];
             let sentMessages;
             if (isOwnerSelf) {
-              await onebotSend(kind, id, message, actualReplyToMessageId, atUserId);
-              sentMessages = [message];
+              for (let i = 0; i < parts.length; i++) {
+                await onebotSend(kind, id, parts[i], i === 0 ? actualReplyToMessageId : null, i === 0 ? atUserId : null);
+              }
+              sentMessages = parts;
             } else {
-              sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
+              sentMessages = parts.length > 1
+                ? await sendMessagesV2(key, parts, parts.map(() => 300), actualReplyToMessageId, atUserId)
+                : await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             }
             recordSentMessagesV2(key, sentMessages);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
-            log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
+            log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/${parts.length} 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
@@ -8242,6 +8244,21 @@ async function main() {
       return await resp.json();
     } finally { clearTimeout(t); }
   }
+  // 远程访问该用哪个 IP：跳过链路本地（169.254.x，Tailscale 等会占先），
+  // 优先星空/VPN 组网网卡，其次普通内网地址。
+  function pickRemoteHost() {
+    let best = null, bestScore = -1;
+    for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+      for (const a of addrs || []) {
+        if (a.family !== 'IPv4' || a.internal) continue;
+        if (a.address.startsWith('169.254.')) continue; // 链路本地，远程不可用
+        const n = name.toLowerCase();
+        const score = n.includes('star') ? 3 : n.includes('vpn') ? 2 : n.includes('tailscale') ? 1 : 0;
+        if (score >= bestScore) { bestScore = score; best = a.address; }
+      }
+    }
+    return best || '127.0.0.1';
+  }
   async function handleQuestCommand(cmd) {
     const [head, ...rest] = cmd.split(/\s+/);
     const arg1 = rest[0] || '';
@@ -8259,6 +8276,23 @@ async function main() {
           : '直通中继未响应（已尝试自动拉起，稍后再问一次）');
       return lines.join('\n');
     }
+    // /q令牌（v0.5）：远程时取 quest 令牌——手机/新设备要填 token 时不用翻本机文件
+    if (head === '/q令牌' || cmd === '令牌' || cmd === 'quest令牌') {
+      const tokenPath = path.join(os.homedir(), '.dsh', 'quests', '.token');
+      let qtok = '';
+      try { qtok = fs.readFileSync(tokenPath, 'utf8').trim(); } catch {}
+      if (!qtok) return '读不到 quest 令牌：' + tokenPath + '（quest 未运行过或数据目录不在默认位置）';
+      const host = pickRemoteHost();
+      return [
+        '【quest 令牌】',
+        qtok,
+        '',
+        '仪表盘（手机/家里开这个，令牌已带上）：',
+        'http://' + host + ':3083/dashboard?token=' + qtok,
+        '',
+        '在页面里填一次即记住；侧边栏文件预览器与仪表盘共用这个令牌。',
+      ].join('\n');
+    }
     if (head === '/帮助') {
       return ['【quest 命令】（也可直接用自然语言让 AI 查）',
         '/q网址 — 当前远程访问地址（同屏+直通，含最新 token）',
@@ -8267,7 +8301,9 @@ async function main() {
         '/q停 <节点> [原因] — 人工终止（不触发自动修复）',
         '/q翻页 [工作区] — 归档卡死的会话并开新会话（前台失联时的逃生通道）',
         '/q确认 <id> — 放行 quest_run 门禁挂起的命令',
-        '/q拒绝 <id> — 作废挂起的命令（从未执行）'].join('\n');
+        '/q拒绝 <id> — 作废挂起的命令（从未执行）',
+        '/q续跑 [节点] — 从断点续跑被中断的节点（无参数=全部）',
+        '/q令牌 — 取 quest 访问令牌（远程填 token 时用）'].join('\n');
     }
     if (head === '/q状态') {
       const d = await questCall('/api/status');
@@ -8285,6 +8321,12 @@ async function main() {
     if (head === '/q停' && arg1) {
       const d = await questCall('/api/cancel', { method: 'POST', body: JSON.stringify({ node: arg1, reason: argRest || 'QQ 人工终止' }) });
       return d.ok ? `已终止 ${arg1}（cancelled 终态，不触发自动修复）` : `终止失败：${d.error}`;
+    }
+    // 一键续跑（v0.5）：重派被中断的节点，quest 自带断点注入
+    if (head === '/q续跑') {
+      const d = await questCall('/api/resume', { method: 'POST', body: JSON.stringify(arg1 ? { node: arg1 } : {}) }, 30000);
+      if (!d.ok) return '续跑失败：' + (d.error || '未知');
+      return '已从断点续跑：' + (d.resumed || []).join('、');
     }
     if (head === '/q确认' && arg1) {
       const d = await questCall('/api/gate/decide', { method: 'POST', body: JSON.stringify({ id: arg1, approve: true }) });
@@ -8348,7 +8390,7 @@ async function main() {
       if (event.user_id === cfg.ownerQQ) {
         const cmdText = await segmentsToText(event.message ?? [], { includeReply: false });
         const cmd = String(cmdText ?? '').trim();
-        if (cmd.startsWith('/') || /^(远程网址|网址)$/.test(cmd)) {
+        if (cmd.startsWith('/') || /^(远程网址|网址|令牌|quest令牌)$/.test(cmd)) {
           const reply = await handleQuestCommand(cmd);
           if (reply !== null) {
             try { await bot.sendPrivateMessage(event.user_id, reply); } catch {}
