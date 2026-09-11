@@ -2916,6 +2916,7 @@ async function main() {
           const kind = keyMatch[1];
           const id = Number(keyMatch[2]);
           if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            log(`[send拒绝] 目标不在模式 ${currentMode} 允许范围 (${key})`);
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -2988,6 +2989,7 @@ async function main() {
             return;
           }
           if (shouldBlockSilentReply(key)) {
+            log(`[send拒绝] 静默模式 (${key})`);
             sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403);
             return;
           }
@@ -4351,10 +4353,12 @@ async function main() {
           // 安全边界：发送工具只允许在 closed-agent（管理员私聊）或 reserved2（二代 AI 带会话令牌）下使用；
           // chat/reserved 的自动转发已覆盖正常回复，MCP 发送工具不应成为 prompt injection 的越权出口。
           if (currentMode === 'chat' || currentMode === 'reserved') {
+            log(`[send拒绝] 模式 ${currentMode} 不允许发送 (${key})`);
             sendJson({ ok: false, error: '发送工具仅限 closed-agent / reserved2 模式使用' }, 403);
             return;
           }
           if (socialV2.paused && token) {
+            log(`[send拒绝] AI 已暂停 (${key})`);
             sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行发送工具' }, 403);
             return;
           }
