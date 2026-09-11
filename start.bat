@@ -1,6 +1,11 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -NoProfile -Command "Start-Process cmd -Verb RunAs -ArgumentList '/c','%~f0'"
+    exit /b
+)
 :loop
 node src/bridge.js
 set code=%errorlevel%
