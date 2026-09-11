@@ -6,12 +6,16 @@
 //
 // 用法：node src/bridge.js （先编辑 ../config.json）
 import fs from 'node:fs';
+import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { execFile, spawn } from 'node:child_process';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
-import { NodeApiClient, unwrap, createTurnCollector } from './dsh-client.js';
+// 2026-09-08 切换到 0.1.2+（@Remote 网关）客户端：认证（token→cookie）+ 斜杠路径单发
+// + remote.mux 事件流聚合。旧 dsh-client.js 保留用于回滚（配 0.1.1-rc.2）。
+import { NodeApiClient, unwrap, createTurnCollector } from './dsh-client-v2.mjs';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
@@ -680,6 +684,71 @@ function canonicalV2Key(key) {
 const APPROVE_WORDS = new Set(['通过', '同意', '允许', '批准', 'yes', 'y', 'approve', 'ok']);
 const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no', 'n', 'reject', 'deny']);
 
+// ── 远程控制 DSH（强杀/重启/修复）───────────────────────────────────────────
+// bridge 必须以管理员启动（start.bat 已自提权）。dsh-control.ps1 由 bridge 直接
+// 调用执行（不再走每分钟轮询的计划任务 / 触发文件，因此没有周期性弹窗）。
+const DSH_CONTROL_SCRIPT = path.join(ROOT, 'dsh-control.ps1');
+function runDshControl(action) {
+  return new Promise((resolve) => {
+    execFile('powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', DSH_CONTROL_SCRIPT, '-Action', action],
+      { timeout: 150000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const out = String(stdout ?? '').trim();
+        const errTxt = String(stderr ?? '').trim();
+        if (out.includes('NOT_ADMIN')) {
+          resolve('❌ bridge 不是管理员权限，杀不动提权的 DSH。请关掉后双击提权的 start.bat 重启 bridge 再试');
+          return;
+        }
+        if (err && !out) {
+          log('[远程控制] 执行失败:', errTxt || err?.message);
+          resolve('❌ 执行失败：' + (errTxt || err?.message || '未知错误').slice(0, 200));
+          return;
+        }
+        resolve(mapDshControlReply(action, out));
+      });
+  });
+}
+function mapDshControlReply(action, out) {
+  if (action === 'kill') {
+    const m = out.match(/^KILLED (\d+) (.+)$/);
+    if (m) return `✅ 已强杀 DSH（pid ${m[1]} ${m[2]}）。要恢复请发：重启DSH`;
+    if (out === 'NONE') return 'DSH 当前没在跑（3080 无监听），无需强杀';
+    if (out.startsWith('FAIL')) return '❌ 强杀失败：3080 仍被占用（bridge 需管理员权限）';
+    return out || '已执行';
+  }
+  if (action === 'restart') {
+    if (out.includes('RESTART_ABORTED')) return '❌ 强杀旧进程失败，未启动新 DSH（bridge 需管理员权限）';
+    if (out.includes('start=READY')) return '✅ DSH 已强杀并重启完成，web 就绪';
+    if (out.includes('start=TIMEOUT')) return '⚠️ DSH 已启动，但 15 秒内 web 未就绪，请稍后确认';
+    return out || '已执行';
+  }
+  if (action === 'web') {
+    if (out.includes('state=READY')) return '✅ DSH web 已启动就绪，并已在主机打开浏览器 http://127.0.0.1:3080';
+    if (out.includes('state=already')) return 'DSH web 本来就在跑，已在主机打开浏览器 http://127.0.0.1:3080';
+    if (out.includes('state=TIMEOUT')) return '⚠️ DSH 已尝试启动，但 web 未在 15 秒内就绪';
+    return out || '已执行';
+  }
+  if (action === 'repair') {
+    if (out.includes('REPAIR_ABORTED')) return '❌ 强杀旧进程失败，未执行修复（bridge 需管理员权限）';
+    if (out.includes('REPAIR_MISSING')) return '❌ 找不到 Desktop\\repair-dsh.ps1';
+    const m = out.match(/REPAIR_DONE web=(\d+)/);
+    if (m) return m[1] === '200'
+      ? '✅ 修复完成（hosts/重启），DSH web 就绪'
+      : `⚠️ 修复流程已跑完，但 DSH web 未就绪（HTTP ${m[1]}），详情看 ~/.dsh-control.log`;
+    return out || '已执行';
+  }
+  if (action === 'status') {
+    const up = out.match(/^UP\s+code=(\d+)\s+pid=(\d+)/);
+    if (up) return `✅ DSH 状态：正常就绪（HTTP ${up[1]}，pid ${up[2]}）`;
+    const fz = out.match(/^FROZEN\s+code=(\d+)\s+pid=(\d+)/);
+    if (fz) return `⚠️ DSH 假死：3080 在听（pid ${fz[2]}）但 HTTP ${fz[1]} 无响应。发「修复」可重启`;
+    if (/^DOWN/.test(out)) return '❌ DSH 没在跑（3080 无监听）。发「开」或「修复」启动';
+    return out || '已执行';
+  }
+  return out || '已执行';
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
@@ -1181,8 +1250,8 @@ async function main() {
     log('⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent');
   }
 
-  // DSH 侧
-  const api = new NodeApiClient(cfg.dsh.baseUrl);
+  // DSH 侧（v2 客户端：token 可在 config.json dsh.token 直传，缺省解析 ~/.dsh/dsh-run.log）
+  const api = new NodeApiClient(cfg.dsh.baseUrl, undefined, { token: cfg.dsh.token || undefined });
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
@@ -1362,6 +1431,56 @@ async function main() {
       flushingQueue = false;
     }
   };
+  let dshEverReady = false; // 区分"首次就绪"（bridge 自己启动）与"断后恢复"（DSH 重启）
+
+  // 远程访问信息（2026-09-10）：星空网卡 IP + 最新 token + 中继存活，供重启通知与 /q网址 共用。
+  // 中继身份校验：pidfile 与 3082 实际属主比对——昨夜沙箱 pocket 抢占过 3082，
+  // 只看"端口有响应"会把冒名者当成中继（HTTP 200 的 Pocket 页 vs 本中继的 401 转发）。
+  function portOwnerTcp(port) {
+    return new Promise((resolve) => {
+      execFile('netstat', ['-ano'], { windowsHide: true, timeout: 8000 }, (err, stdout) => {
+        if (err) return resolve(0);
+        const line = String(stdout).split(/\r?\n/).map((l) => l.trim()).find((l) => l.includes(':' + port + ' ') && l.includes('LISTENING'));
+        if (!line) return resolve(0);
+        const m = line.match(/(\d+)\s*$/);
+        resolve(m ? Number(m[1]) : 0);
+      });
+    });
+  }
+  async function relayStatus(dshHome) {
+    // 返回 { ok, conflict }
+    const pidFile = path.join(dshHome, 'dsh-direct-relay-3082.pid');
+    let pid = 0;
+    try { pid = Number(fs.readFileSync(pidFile, 'utf8').trim()); } catch { return { ok: false, conflict: '' }; }
+    try { process.kill(pid, 0); } catch { return { ok: false, conflict: '' }; } // pidfile 里的中继已死
+    const owner = await portOwnerTcp(3082);
+    if (owner === pid) return { ok: true, conflict: '' };
+    return { ok: false, conflict: `3082 被其它进程（pid=${owner}）占用` };
+  }
+  async function dshAccessInfo() {
+    const dshHome = path.join(os.homedir(), '.dsh');
+    let token = '';
+    try {
+      const t = fs.readFileSync(path.join(dshHome, 'dsh-run.log'), 'utf8');
+      const ms = [...t.matchAll(/dsh web: http:\/\/127\.0\.0\.1:3080\/\?token=([A-Za-z0-9_-]+)/g)];
+      if (ms.length) token = ms[ms.length - 1][1];
+    } catch {}
+    let vip = '';
+    for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+      if (!/star|vpn/i.test(name)) continue;
+      for (const a of addrs || []) if (a.family === 'IPv4' && !a.internal) { vip = a.address; break; }
+    }
+    let { ok: relayOk, conflict: relayConflict } = await relayStatus(dshHome);
+    if (!relayOk && !relayConflict) {
+      try {
+        spawn(process.execPath, ['dsh-direct-relay.mjs'], { cwd: dshHome, detached: true, stdio: 'ignore', windowsHide: true }).unref();
+        await new Promise((r) => setTimeout(r, 2500));
+        ({ ok: relayOk, conflict: relayConflict } = await relayStatus(dshHome));
+      } catch {}
+    }
+    return { vip, token, relayOk, relayConflict };
+  }
+
   const checkDsh = async () => {
     let ok = false;
     try {
@@ -1374,6 +1493,29 @@ async function main() {
         dshReady = true;
         lastMode = currentMode;
         log(`DSH 已就绪（模式: ${currentMode}）`);
+        // DSH 重启通知（2026-09-10）：断后恢复 = DSH 重启过，推新 token 地址。
+        // 静默期（看门狗假死循环写 dsh-quiet.flag）不推；30 分钟冷却防轰炸；
+        // 直通中继挂了顺手拉起（同 node.exe，继承防火墙放行）。
+        if (dshEverReady) {
+          (async () => {
+            try {
+              const dshHome = path.join(os.homedir(), '.dsh');
+              if (fs.existsSync(path.join(dshHome, 'dsh-quiet.flag'))) { log('DSH 重启通知跳过：看门狗静默期'); return; }
+              const now = Date.now();
+              if (now - (checkDsh.lastNotifyAt || 0) < 30 * 60 * 1000) { log('DSH 重启通知跳过：冷却中'); return; }
+              checkDsh.lastNotifyAt = now;
+              const info = await dshAccessInfo();
+              if (!info.token) { log('DSH 重启通知跳过：日志里没找到 token'); return; }
+              const direct = info.relayOk ? `\n直通（无常驻负载，推荐）：http://${info.vip}:3082/?token=${info.token}`
+                : (info.relayConflict ? `\n⚠️ 直通中继异常：${info.relayConflict}，今晚用同屏门` : '');
+              await sendToQQ(`private:${cfg.ownerQQ}`, `🔄 DSH 已重启（token 已换新）\n同屏：http://${info.vip}:3081（密码不变）${direct}`);
+            } catch (e) { log('DSH 重启通知失败:', e?.message ?? e); }
+          })();
+        } else {
+          // 首次就绪（开机/bridge 自启）：不推送，但顺手确保直通中继活着——否则重启后 3082 死到下次 DSH 重启才被救
+          dshAccessInfo().catch(() => {});
+        }
+        dshEverReady = true;
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
           // 避免在 initial chat 模式下设置定时器导致 timeout 唤醒被模式守卫吞掉。
@@ -4157,6 +4299,45 @@ async function main() {
         }
 
         // ── 统一发送端点（MCP 旧发送工具也走这里） ───────────────────────────
+        // ── quest 产物图直推（2026-09-09）：owner 私聊发本机图片文件（base64 image 段）────
+        // 仅限控制台令牌（quest 的 qqPush 用）+ owner 目标，不开放成通用出站图片口。
+        if (req.method === 'POST' && url.pathname === '/api/send/private-image') {
+          const body = await readBody();
+          const userId = String(body.userId ?? '').trim();
+          const imagePath = String(body.imagePath ?? '').trim();
+          const caption = String(body.caption ?? '').slice(0, 200);
+          if (String(userId) !== String(cfg.ownerQQ)) { sendJson({ ok: false, error: '图片直推仅限 owner 私聊' }, 403); return; }
+          // 本地盘绝对路径 + 图片扩展名白名单；拒绝 UNC/相对路径/隐藏文件
+          if (!/^[a-z]:[\\/][^<>:"|?*]+$/i.test(imagePath) || !/\.(png|jpe?g|gif|webp)$/i.test(imagePath) || path.basename(imagePath).startsWith('.')) {
+            sendJson({ ok: false, error: '仅支持本地盘绝对路径的 png/jpg/gif/webp 文件' }, 400); return;
+          }
+          try {
+            const st = fs.statSync(imagePath);
+            if (!st.isFile()) { sendJson({ ok: false, error: '不是文件' }, 400); return; }
+            if (st.size > 15 * 1024 * 1024) { sendJson({ ok: false, error: '图片超过 15MB' }, 413); return; }
+            const b64 = fs.readFileSync(imagePath).toString('base64');
+            const segments = [];
+            if (caption) segments.push({ type: 'text', data: { text: escapeCqText(caption) } });
+            segments.push({ type: 'image', data: { file: `base64://${b64}` } });
+            const httpUrl0 = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const res0 = await fetch(`${httpUrl0}/send_private_msg`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify({ user_id: Number(userId), message: segments }),
+              signal: AbortSignal.timeout(30000)
+            });
+            const jb = await res0.json().catch(() => ({}));
+            if (!res0.ok || jb.status !== 'ok' || jb.retcode !== 0) throw new Error(`OneBot 发图失败: ${jb.wording || jb.retcode || res0.status}`);
+            sendJson({ ok: true }, 200);
+          } catch (e) {
+            log('产物图直推失败:', e?.message ?? e);
+            sendJson({ ok: false, error: String(e?.message ?? e).slice(0, 200) }, 502);
+          }
+          return;
+        }
         if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {
           const body = await readBody();
           const token = String(body.token ?? '').trim();
@@ -4218,7 +4399,10 @@ async function main() {
           const sendCfg = cfg.socialV2?.send ?? {};
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
-          if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+          // owner 私聊（本机自动化通知，如 python-manager 任务完成推送）放行敏感词：
+          // 通知内容含本机工作区路径是必要信息，且接收者是 owner 自己，不存在泄露风险
+          const isOwnerSelf = key === `private:${cfg.ownerQQ}`;
+          if (!isOwnerSelf && SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
           try {
             const st = getSocialV2State(key);
             const now = Date.now();
@@ -4232,7 +4416,16 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
+            // 2026-09-11：owner 自通知（quest/python-manager 等用 console-token 推送）走专用直发通道，
+            // 不排共享 sendChain——否则会被 AI 的长回复（切多条+间隔 300ms+单条 15s 超时）堵住，
+            // 排队超过调用方 5s 超时即被丢弃（今天 11:01/11:23 两条实验通知就是这么丢的）。
+            let sentMessages;
+            if (isOwnerSelf) {
+              await onebotSend(kind, id, message, actualReplyToMessageId, atUserId);
+              sentMessages = [message];
+            } else {
+              sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
+            }
             recordSentMessagesV2(key, sentMessages);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
@@ -4316,7 +4509,11 @@ async function main() {
           let archivedCount = 0;
           try {
             const ws = unwrap(await api.workspace.list({}), 'workspace.list');
-            const qq = ws.items.find((w) => w.title === cfg.workspaceTitle);
+            // 0.1.2：workspace.list shim 按 cwd 分组（title=路径）。
+            // 除旧标题外也按 agents 目录路径匹配（斜杠归一化），覆盖 rename 失效后的新会话。
+            const agentsDir = String(cfg.sessionCwd ? cfg.sessionCwd : path.join(STATE_DIR, 'agents')).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+            const qq = ws.items.find((w) => w.title === cfg.workspaceTitle
+              || String(w.title || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() === agentsDir);
             if (qq) {
               for (const sid of qq.sessionIds) {
                 try { await api.workspace.archiveSession({ sessionId: sid }); archivedCount += 1; } catch {}
@@ -8022,8 +8219,140 @@ async function main() {
     reconnect: true
   });
 
+  // ── quest 命令（P3）：/帮助 /q状态 /q派发 <node> /q停 <node> [原因] ─────────
+  // 直连 quest API（3110），零 token、DSH 挂了也能查。非 / 开头返回 null 走正常 AI 聊天。
+  const QUEST_API = 'http://127.0.0.1:3110';
+  async function questCall(pathname, init = {}, ms = 8000) {
+    const fsMod = await import('node:fs');
+    const osMod = await import('node:os');
+    const pathMod = await import('node:path');
+    const token = fsMod.readFileSync(pathMod.join(osMod.homedir(), '.dsh', 'quests', '.token'), 'utf8').trim();
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), ms);
+    try {
+      const resp = await fetch(`${QUEST_API}${pathname}`, {
+        ...init,
+        headers: { 'content-type': 'application/json', 'x-quest-token': token, ...(init.headers || {}) },
+        signal: ac.signal,
+      });
+      return await resp.json();
+    } finally { clearTimeout(t); }
+  }
+  async function handleQuestCommand(cmd) {
+    const [head, ...rest] = cmd.split(/\s+/);
+    const arg1 = rest[0] || '';
+    const argRest = rest.slice(1).join(' ');
+    // /q网址（2026-09-10）：当前远程访问地址。不走 quest API，本地拼装（星空 IP + 日志最新 token + 中继自愈）。
+    if (head === '/q网址' || cmd === '远程网址' || cmd === '网址') {
+      const info = await dshAccessInfo();
+      if (!info.vip) return '没找到星空组网虚拟网卡（接口名需含 Star/VPN），检查组网是否在线';
+      const lines = ['【远程网址】',
+        `同屏（镜像工位画面）：http://${info.vip}:3081（LAN 密码不变）`];
+      lines.push(info.token && info.relayOk
+        ? `直通（独立完整界面，无常驻负载）：http://${info.vip}:3082/?token=${info.token}`
+        : info.relayConflict
+          ? `⚠️ 直通中继异常：${info.relayConflict}——用同屏门，或到电脑上跑 taskkill /PID <该pid> /T /F 后再问一次`
+          : '直通中继未响应（已尝试自动拉起，稍后再问一次）');
+      return lines.join('\n');
+    }
+    if (head === '/帮助') {
+      return ['【quest 命令】（也可直接用自然语言让 AI 查）',
+        '/q网址 — 当前远程访问地址（同屏+直通，含最新 token）',
+        '/q状态 — 任务线全景（最近活跃工作区，零 token）',
+        '/q派发 <节点> — 派发/重派某节点',
+        '/q停 <节点> [原因] — 人工终止（不触发自动修复）',
+        '/q翻页 [工作区] — 归档卡死的会话并开新会话（前台失联时的逃生通道）',
+        '/q确认 <id> — 放行 quest_run 门禁挂起的命令',
+        '/q拒绝 <id> — 作废挂起的命令（从未执行）'].join('\n');
+    }
+    if (head === '/q状态') {
+      const d = await questCall('/api/status');
+      if (d.error) return `quest 不可用：${d.error}`;
+      const nodes = d.plan?.nodes ?? [];
+      if (!nodes.length) return '当前没有任务线。';
+      const lines = nodes.map((n) => `${n.status === 'running' ? '▶' : n.status === 'completed' ? '✅' : n.status === 'failed' ? '❌' : n.status === 'cancelled' ? '🛑' : n.status === 'frozen' ? '⛔' : n.status === 'skipped' ? '⏭' : '·'} ${n.id}: ${n.status}${n.verdict && n.verdict !== n.status ? `（${n.verdict}）` : ''}${n.metrics?.loss_last != null ? ` loss=${n.metrics.loss_last}` : ''}`);
+      const unread = (d.unread ?? []).map((u) => `📣 ${u.node}:${u.verdict}`).join('\n');
+      return `${d.plan.title || d.plan.workspace || ''}\n${lines.join('\n')}${unread ? `\n${unread}` : ''}`.slice(0, 900);
+    }
+    if (head === '/q派发' && arg1) {
+      const d = await questCall('/api/dispatch', { method: 'POST', body: JSON.stringify({ node: arg1 }) });
+      return d.ok ? `已派发 ${arg1}（${d.jobId ?? ''}）` : `派发失败：${d.error}`;
+    }
+    if (head === '/q停' && arg1) {
+      const d = await questCall('/api/cancel', { method: 'POST', body: JSON.stringify({ node: arg1, reason: argRest || 'QQ 人工终止' }) });
+      return d.ok ? `已终止 ${arg1}（cancelled 终态，不触发自动修复）` : `终止失败：${d.error}`;
+    }
+    if (head === '/q确认' && arg1) {
+      const d = await questCall('/api/gate/decide', { method: 'POST', body: JSON.stringify({ id: arg1, approve: true }) });
+      return d.ok ? `已放行 ${arg1}，任务开始跑（照常走判定/总结/通知）` : `放行失败：${d.error}`;
+    }
+    if (head === '/q拒绝' && arg1) {
+      const d = await questCall('/api/gate/decide', { method: 'POST', body: JSON.stringify({ id: arg1, approve: false }) });
+      return d.ok ? `已作废 ${arg1}（命令从未执行）` : `作废失败：${d.error}`;
+    }
+    // 翻页（flip）：归档该工作区全部会话 + 开新会话并注入 research-state.md 恢复提示。
+    // 前台卡死时用户唯一的会话轮转入口；DSH 网关若彻底挂了会超时报错（先用「重启」救 DSH 再翻页）。
+    if (head === '/q翻页') {
+      // 参数解析（2026-09-10）：短名模糊匹配工作区（键或标题包含即候选）；多候选列出来让用户挑，不瞎猜
+      let wsArg = arg1;
+      if (arg1) {
+        const wl = await questCall('/api/workspaces');
+        const k = arg1.toLowerCase();
+        const hits = (wl.workspaces || []).filter((w) => w.wsKey.toLowerCase().includes(k) || String(w.title || '').toLowerCase().includes(k));
+        if (hits.length === 1) wsArg = hits[0].wsKey;
+        else if (hits.length > 1) return `「${arg1}」匹配到 ${hits.length} 个工作区，说全一点：
+` + hits.slice(0, 6).map((w) => `- ${w.wsKey}${w.title ? '（' + w.title + '）' : ''}`).join('\n');
+      }
+      const d = wsArg ? await questCall(`/api/status?ws=${encodeURIComponent(wsArg)}`) : await questCall('/api/status');
+      const wsPath = d?.plan?.workspace;
+      if (!wsPath) return `翻页失败：找不到工作区${arg1 ? `「${arg1}」` : '（没有最近活跃的，试试 /q翻页 <目录名>）'}`;
+      const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath }) }, 90000);
+      if (f.ok) return `翻页完成：归档 ${f.archived.length} 个会话，新会话已建好并注入恢复提示。刷新前台即可用。`;
+      return `翻页出错：${(f.errors || []).join('；').slice(0, 250) || 'DSH 无响应（若前台也卡死，先发「重启」救活 DSH 再翻页）'}`;
+    }
+    return null; // 未识别的 / 命令不拦截，走 AI
+  }
+
   bot.onPrivateMessage(async (event) => {
     if (event.user_id === event.self_id) return;
+    // 【远程控制】owner 私聊触发词 → 直接执行（bridge 已提权，可强杀提权的 DSH 并重启）。
+    // 不再写触发文件走每分钟轮询的计划任务，因此没有周期性弹窗。
+    try {
+      if (event.user_id === cfg.ownerQQ) {
+        const cmdText = await segmentsToText(event.message ?? [], { includeReply: false });
+        const cmd = String(cmdText ?? '').trim();
+        let action = null;
+        if (cmd && cmd.length <= 12) {
+          if (/^(强杀|硬杀)(dsh|deepseek)?$|^杀(dsh|deepseek)$|^kill(\s+dsh)?$/i.test(cmd)) action = 'kill';
+          else if (/^(重启|救活|救|硬启)(dsh|deepseek)?$|^restart(\s+dsh)?$/i.test(cmd)) action = 'restart';
+          else if (/^(开|打开)(dsh|deepseek|web|网页)$/i.test(cmd) || /^(web|openweb)$/i.test(cmd)) action = 'web';
+          else if (/^(修复)(dsh|deepseek)?$|^repair(\s+dsh)?$/i.test(cmd)) action = 'repair';
+          else if (/^(状态|查状态|看状态|健康检查|health|status)$/i.test(cmd)
+                || /^(查|看|检查|诊断)(dsh|deepseek)$/i.test(cmd)
+                || /^dsh(状态|情况|status|health)?$/i.test(cmd)) action = 'status';
+        }
+        if (action) {
+          log(`[远程控制] owner 触发 DSH ${action}: ${cmd}`);
+          const reply = await runDshControl(action);
+          try { await bot.sendPrivateMessage(event.user_id, reply); } catch {}
+          return;
+        }
+      }
+    } catch (error) { log('远程控制判断出错:', error?.message ?? error); }
+    // 【quest 命令】owner 私聊 / 前缀 → 直连 quest API（零 token、DSH 挂了也能用）
+    try {
+      if (event.user_id === cfg.ownerQQ) {
+        const cmdText = await segmentsToText(event.message ?? [], { includeReply: false });
+        const cmd = String(cmdText ?? '').trim();
+        if (cmd.startsWith('/') || /^(远程网址|网址)$/.test(cmd)) {
+          const reply = await handleQuestCommand(cmd);
+          if (reply !== null) {
+            try { await bot.sendPrivateMessage(event.user_id, reply); } catch {}
+            return;
+          }
+        }
+      }
+    } catch (error) { log('quest 命令处理出错:', error?.message ?? error); }
     try { await handleIncoming('private', event.user_id, event, cfg); } catch (error) { log('处理私聊消息出错:', error?.message ?? error); }
   });
   bot.onGroupMessage(async (event) => {
