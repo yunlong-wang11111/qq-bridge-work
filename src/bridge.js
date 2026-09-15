@@ -11,6 +11,7 @@ import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { buildRemoteUrls } from './remote-urls.mjs';   // /q网址 的拼装（纯函数，scripts/test-remote-urls.mjs 可直测）
 import { execFile, spawn } from 'node:child_process';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 // 2026-09-08 切换到 0.1.2+（@Remote 网关）客户端：认证（token→cookie）+ 斜杠路径单发
@@ -8246,6 +8247,8 @@ async function main() {
   }
   // 远程访问该用哪个 IP：跳过链路本地（169.254.x，Tailscale 等会占先），
   // 优先星空/VPN 组网网卡，其次普通内网地址。
+  // 星空组网 IP 固定优先（用户 2026-09-15 确认 192.168.188.1 基本不变）：
+  // 以前只看接口名含 star/vpn，网卡改名或加新虚拟网卡就会漂；现在按网段直接锁定。
   function pickRemoteHost() {
     let best = null, bestScore = -1;
     for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
@@ -8253,49 +8256,68 @@ async function main() {
         if (a.family !== 'IPv4' || a.internal) continue;
         if (a.address.startsWith('169.254.')) continue; // 链路本地，远程不可用
         const n = name.toLowerCase();
-        const score = n.includes('star') ? 3 : n.includes('vpn') ? 2 : n.includes('tailscale') ? 1 : 0;
+        const score = a.address.startsWith('192.168.188.')
+          ? 4                                            // 星空组网固定网段（最优先）
+          : n.includes('star') ? 3 : n.includes('vpn') ? 2 : n.includes('tailscale') ? 1 : 0;
         if (score >= bestScore) { bestScore = score; best = a.address; }
       }
     }
     return best || '127.0.0.1';
   }
+  // quest 侧访问信息（2026-09-15）：令牌 + "最近活跃工作区"（quest 已把在跑/有节点的排前面，取第一项即可）
+  async function questAccessInfo(hint) {
+    const tokenPath = path.join(os.homedir(), '.dsh', 'quests', '.token');
+    let token = '';
+    try { token = fs.readFileSync(tokenPath, 'utf8').trim(); } catch {}
+    let wsKey = '', wsPath = '';
+    try {
+      const r = await fetch('http://127.0.0.1:3110/api/workspaces', {
+        headers: token ? { 'x-quest-token': token } : {},
+        signal: AbortSignal.timeout(4000),
+      });
+      const j = await r.json();
+      const list = (j.workspaces || []).filter((w) => !w.junk);
+      const h = hint ? String(hint).toLowerCase() : '';
+      const hit = h ? list.find((w) => String(w.workspace || '').toLowerCase().includes(h) || String(w.wsKey).toLowerCase().includes(h)) : null;
+      const pick = hit || list[0];
+      if (pick) { wsKey = pick.wsKey; wsPath = pick.workspace || ''; }
+    } catch {}
+    return { token, wsKey, wsPath };
+  }
   async function handleQuestCommand(cmd) {
     const [head, ...rest] = cmd.split(/\s+/);
     const arg1 = rest[0] || '';
     const argRest = rest.slice(1).join(' ');
-    // /q网址（2026-09-10）：当前远程访问地址。不走 quest API，本地拼装（星空 IP + 日志最新 token + 中继自愈）。
+    // /q网址 [工作区关键词]（2026-09-10 加，2026-09-15 扩成"控制台 + DSH"两条）：
+    // 远程最常要的就是这两个带 token 的地址；拼装逻辑在 src/remote-urls.mjs（纯函数，可直测）。
     if (head === '/q网址' || cmd === '远程网址' || cmd === '网址') {
       const info = await dshAccessInfo();
-      if (!info.vip) return '没找到星空组网虚拟网卡（接口名需含 Star/VPN），检查组网是否在线';
-      const lines = ['【远程网址】',
-        `同屏（镜像工位画面）：http://${info.vip}:3081（LAN 密码不变）`];
-      lines.push(info.token && info.relayOk
-        ? `直通（独立完整界面，无常驻负载）：http://${info.vip}:3082/?token=${info.token}`
-        : info.relayConflict
-          ? `⚠️ 直通中继异常：${info.relayConflict}——用同屏门，或到电脑上跑 taskkill /PID <该pid> /T /F 后再问一次`
-          : '直通中继未响应（已尝试自动拉起，稍后再问一次）');
-      return lines.join('\n');
+      if (!info.vip) return '没找到星空组网虚拟网卡（网段 192.168.188.* 或接口名含 Star/VPN），检查组网是否在线';
+      const q = await questAccessInfo(arg1);
+      return buildRemoteUrls({
+        vip: info.vip, dshToken: info.token, questToken: q.token,
+        wsKey: q.wsKey, wsPath: q.wsPath, relayConflict: info.relayConflict,
+      }).text;
     }
     // /q令牌（v0.5）：远程时取 quest 令牌——手机/新设备要填 token 时不用翻本机文件
     if (head === '/q令牌' || cmd === '令牌' || cmd === 'quest令牌') {
-      const tokenPath = path.join(os.homedir(), '.dsh', 'quests', '.token');
-      let qtok = '';
-      try { qtok = fs.readFileSync(tokenPath, 'utf8').trim(); } catch {}
-      if (!qtok) return '读不到 quest 令牌：' + tokenPath + '（quest 未运行过或数据目录不在默认位置）';
-      const host = pickRemoteHost();
+      const q2 = await questAccessInfo(arg1);
+      if (!q2.token) return '读不到 quest 令牌：' + path.join(os.homedir(), '.dsh', 'quests', '.token') + '（quest 未运行过或数据目录不在默认位置）';
+      const host2 = pickRemoteHost();
       return [
         '【quest 令牌】',
-        qtok,
+        q2.token,
         '',
-        '仪表盘（手机/家里开这个，令牌已带上）：',
-        'http://' + host + ':3083/dashboard?token=' + qtok,
+        '仪表盘（手机/家里开这个，令牌已带上；v2 控制台 = 任务线画布页）：',
+        'http://' + host2 + ':3083/dashboard-v2?token=' + q2.token + (q2.wsKey ? '&ws=' + q2.wsKey : ''),
         '',
         '在页面里填一次即记住；侧边栏文件预览器与仪表盘共用这个令牌。',
+        '（要看 DSH 的地址/令牌，发 /q网址）',
       ].join('\n');
     }
     if (head === '/帮助') {
       return ['【quest 命令】（也可直接用自然语言让 AI 查）',
-        '/q网址 — 当前远程访问地址（同屏+直通，含最新 token）',
+        '/q网址 [工作区关键词] — 远程访问地址：控制台（带 token+ws）+ DSH（同屏 3081 / 直通 3082）',
         '/q状态 — 任务线全景（最近活跃工作区，零 token）',
         '/q派发 <节点> — 派发/重派某节点',
         '/q停 <节点> [原因] — 人工终止（不触发自动修复）',
@@ -8353,7 +8375,10 @@ async function main() {
       const wsPath = d?.plan?.workspace;
       if (!wsPath) return `翻页失败：找不到工作区${arg1 ? `「${arg1}」` : '（没有最近活跃的，试试 /q翻页 <目录名>）'}`;
       const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath }) }, 90000);
-      if (f.ok) return `翻页完成：归档 ${f.archived.length} 个会话，新会话已建好并注入恢复提示。刷新前台即可用。`;
+      if (f.ok) return [
+        `翻页完成：归档 ${f.archived.length} 个会话；新会话已建好并注入恢复提示${f.created ? '（id ' + String(f.created).slice(0, 20) + '…）' : ''}。`,
+        '⚠️ DSH 前端不会自动切过去——请在左侧会话列表里打开**最新那条**（列表里看不到就先 F5 刷一下）。',
+      ].join('\n');
       return `翻页出错：${(f.errors || []).join('；').slice(0, 250) || 'DSH 无响应（若前台也卡死，先发「重启」救活 DSH 再翻页）'}`;
     }
     return null; // 未识别的 / 命令不拦截，走 AI
