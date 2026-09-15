@@ -8374,11 +8374,18 @@ async function main() {
       const d = wsArg ? await questCall(`/api/status?ws=${encodeURIComponent(wsArg)}`) : await questCall('/api/status');
       const wsPath = d?.plan?.workspace;
       if (!wsPath) return `翻页失败：找不到工作区${arg1 ? `「${arg1}」` : '（没有最近活跃的，试试 /q翻页 <目录名>）'}`;
-      const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath }) }, 90000);
-      if (f.ok) return [
-        `翻页完成：归档 ${f.archived.length} 个会话；新会话已建好并注入恢复提示${f.created ? '（id ' + String(f.created).slice(0, 20) + '…）' : ''}。`,
-        '⚠️ DSH 前端不会自动切过去——请在左侧会话列表里打开**最新那条**（列表里看不到就先 F5 刷一下）。',
-      ].join('\n');
+      const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath }) }, 240000);   // 翻页含"老会话写交接"阶段（最长约 150s），90s 会中途断
+      if (f.ok || f.archived) {
+        const h = f.handoff;
+        const hLine = !h ? '' : h.wrote
+          ? `交接：老会话已把 research-state.md 写新鲜 ✓（等了 ${h.waitedSec}s）`
+          : `交接：${h.note || '未写成'}——新会话会读旧版并提示你`;
+        return [
+          `翻页完成：归档 ${f.archived.length} 个会话；新会话已建好（${f.created ? 'id ' + String(f.created).slice(0, 20) + '…' : ''}），已注入恢复提示（读交接 → 查任务线 → 复述确认后才动手）。`,
+          hLine,
+          '⚠️ DSH 前端不会自动切过去——请在左侧会话列表里打开**最新那条**（列表里看不到就先 F5 刷一下）。',
+        ].filter(Boolean).join('\n');
+      }
       return `翻页出错：${(f.errors || []).join('；').slice(0, 250) || 'DSH 无响应（若前台也卡死，先发「重启」救活 DSH 再翻页）'}`;
     }
     return null; // 未识别的 / 命令不拦截，走 AI
