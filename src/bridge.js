@@ -8321,7 +8321,7 @@ async function main() {
         '/q状态 — 任务线全景（最近活跃工作区，零 token）',
         '/q派发 <节点> — 派发/重派某节点',
         '/q停 <节点> [原因] — 人工终止（不触发自动修复）',
-        '/q翻页 [工作区] — 归档卡死的会话并开新会话（前台失联时的逃生通道）',
+        '/q翻页 [工作区] — 翻页：写交接→归档→开新会话（控制台右上也有翻页按钮；对话里也可让 AI 调 quest_flip）',
         '/q确认 <id> — 放行 quest_run 门禁挂起的命令',
         '/q拒绝 <id> — 作废挂起的命令（从未执行）',
         '/q续跑 [节点] — 从断点续跑被中断的节点（无参数=全部）',
@@ -8375,18 +8375,20 @@ async function main() {
       const wsPath = d?.plan?.workspace;
       if (!wsPath) return `翻页失败：找不到工作区${arg1 ? `「${arg1}」` : '（没有最近活跃的，试试 /q翻页 <目录名>）'}`;
       const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath }) }, 240000);   // 翻页含"老会话写交接"阶段（最长约 150s），90s 会中途断
-      if (f.ok || f.archived) {
+      // ⚠️ 成功判定只看 f.ok：f.archived 是数组，空数组 [] 也是 truthy——
+      // 2026-09-15 事故：内部全失败仍显示"翻页完成：归档 0 个"的假成功，误导了一整轮排查。
+      if (f.ok && f.created) {
         const h = f.handoff;
         const hLine = !h ? '' : h.wrote
           ? `交接：老会话已把 research-state.md 写新鲜 ✓（等了 ${h.waitedSec}s）`
           : `交接：${h.note || '未写成'}——新会话会读旧版并提示你`;
         return [
-          `翻页完成：归档 ${f.archived.length} 个会话；新会话已建好（${f.created ? 'id ' + String(f.created).slice(0, 20) + '…' : ''}），已注入恢复提示（读交接 → 查任务线 → 复述确认后才动手）。`,
+          `翻页完成【${wsPath}】：归档 ${f.archived.length} 个会话（匹配 ${f.matched ?? '?'} 个）；新会话 ${String(f.created).slice(0, 20)}…，已注入恢复提示（读交接 → 查任务线 → 复述确认后才动手）。`,
           hLine,
           '⚠️ DSH 前端不会自动切过去——请在左侧会话列表里打开**最新那条**（列表里看不到就先 F5 刷一下）。',
         ].filter(Boolean).join('\n');
       }
-      return `翻页出错：${(f.errors || []).join('；').slice(0, 250) || 'DSH 无响应（若前台也卡死，先发「重启」救活 DSH 再翻页）'}`;
+      return `翻页出错【目标 ${wsPath}】：${(f.errors || []).join('；').slice(0, 250) || 'DSH 无响应（若前台也卡死，先发「重启」救活 DSH 再翻页）'}——旧会话未被归档、原样保留。`;
     }
     return null; // 未识别的 / 命令不拦截，走 AI
   }
