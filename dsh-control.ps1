@@ -33,9 +33,11 @@ function Start-Dsh {
   Remove-Item (Join-Path $env:USERPROFILE '.dsh\task-board\ledger-v2.lock') -ErrorAction SilentlyContinue
   # capture DSH console so a freeze/crash leaves a trace (2026-09-07)
   # cmd /c internal redirect avoids Start-Process -Redirect hang in elevated+piped context
+  # 2026-09-29 堆上限 4G→16G（63G 物理内存）：OOM 崩溃会打断会话上下文与思考链，
+  # 与用户级 setx NODE_OPTIONS 同值双保险（守护链进程可能不继承新注册表环境变量）。
   $runLog = Join-Path $env:USERPROFILE '.dsh\dsh-run.log'
   $dshCmd = "$env:APPDATA\npm\dsh.cmd"
-  $cmdLine = '/c ' + $dshCmd + ' web --host 127.0.0.1 --no-open >> "' + $runLog + '" 2>&1'
+  $cmdLine = '/c set NODE_OPTIONS=--max-old-space-size=16384&& ' + $dshCmd + ' web --host 127.0.0.1 --no-open >> "' + $runLog + '" 2>&1'
   Start-Process "$env:SystemRoot\System32\cmd.exe" -ArgumentList $cmdLine -WindowStyle Hidden
   # DSH 冷启动超过 15s（repair-dsh.ps1 等 40s）——这里对齐到 40s，避免提前判 TIMEOUT
   for ($i = 0; $i -lt 80; $i++) {

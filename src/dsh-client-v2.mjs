@@ -87,20 +87,57 @@ export class NodeApiClient {
     }
   }
 
+  // 2026-09-30 耐用化:cookie 落盘复用 + 多 token 依次试。
+  // 事故形态:pocket 更新器等非标准管道拉起 DSH 时,launchToken 不落 dsh-run.log——
+  // 桥(有缓存 cookie)活着而 quest(重启后无 cookie)全 401,quest_spawn 断。
+  #cookieCacheFile = path.join(os.homedir(), '.dsh', 'dsh-cookie.cache.json');
+  #loadPersistedCookie() {
+    try {
+      const c = JSON.parse(fs.readFileSync(this.#cookieCacheFile, 'utf8'));
+      if (c.baseUrl === this.baseUrl && c.cookie && Date.now() - Date.parse(c.at) < 14 * 24 * 3600 * 1000) return c.cookie;
+    } catch {}
+    return null;
+  }
+  #persistCookie(cookie) {
+    try { fs.writeFileSync(this.#cookieCacheFile, JSON.stringify({ baseUrl: this.baseUrl, cookie, at: new Date().toISOString() })); } catch {}
+  }
+
   async #ensureCookie(force = false) {
     if (!force && this.cookie && Date.now() - this.cookieAt < 24 * 3600 * 1000) return this.cookie;
-    const token = this.tokenOpt || parseBootToken(this.tokenLog);
-    if (!token) throw new Error('dsh-client: 无法获得 DSH token（构造参数缺失且 ' + this.tokenLog + ' 无 "dsh web:" 行）');
-    const resp = await this.#fetchWithDeadline(`${this.baseUrl}/?token=${token}`, { redirect: 'manual' }, 10000);
-    const setCookie = resp.headers.get('set-cookie') || '';
-    // 关键：303 的 chunked 响应体必须消费/取消掉，否则 undici 把这条 keep-alive 连接
-    // 留在未终结状态，后续请求复用时会永久挂起（2026-09-08 生产定位）
-    try { await resp.body?.cancel(); } catch {}
-    const cookie = setCookie.split(';')[0];
-    if (!cookie || !cookie.includes('=')) throw new Error(`dsh-client: token 换 cookie 失败（HTTP ${resp.status}）`);
-    this.cookie = cookie;
-    this.cookieAt = Date.now();
-    return cookie;
+    // ① 落盘 cookie 优先(cookie 由持久签名密钥签发,30 天有效——跨 DSH 重启仍可用,
+    //    这是"token 没落日志"场景下唯一可靠的凭证来源)
+    if (!this.cookie && !force) {
+      const cached = this.#loadPersistedCookie();
+      if (cached) { this.cookie = cached; this.cookieAt = Date.now(); this.#persistCookie(cached); return cached; }
+    }
+    // ② token 换 cookie:直传 token → 日志里最近 5 个 token 依次试(最后一个可能来自
+    //    旧实例,但 DSH 端签名密钥持久,旧 cookie 才是硬通货;新 token 只要有一个匹配就成)
+    const tokens = [];
+    if (this.tokenOpt) tokens.push(this.tokenOpt);
+    try {
+      const text = fs.readFileSync(this.tokenLog, 'utf8');
+      const matches = [...text.matchAll(/dsh web: https?:\/\/\S+\?token=([A-Za-z0-9_-]+)/g)];
+      for (let i = matches.length - 1; i >= 0 && tokens.length < 6; i--) {
+        if (!tokens.includes(matches[i][1])) tokens.push(matches[i][1]);
+      }
+    } catch {}
+    if (!tokens.length) throw new Error('dsh-client: 无法获得 DSH token（构造参数缺失且 ' + this.tokenLog + ' 无 "dsh web:" 行）');
+    let lastStatus = 0;
+    for (const token of tokens) {
+      const resp = await this.#fetchWithDeadline(`${this.baseUrl}/?token=${token}`, { redirect: 'manual' }, 10000);
+      const setCookie = resp.headers.get('set-cookie') || '';
+      // 关键：303 的 chunked 响应体必须消费/取消掉，否则 undici 把这条 keep-alive 连接
+      // 留在未终结状态，后续请求复用时会永久挂起（2026-09-08 生产定位）
+      try { await resp.body?.cancel(); } catch {}
+      const cookie = setCookie.split(';')[0];
+      if (cookie && cookie.includes('=')) {
+        this.cookie = cookie; this.cookieAt = Date.now();
+        this.#persistCookie(cookie);
+        return cookie;
+      }
+      lastStatus = resp.status;
+    }
+    throw new Error(`dsh-client: token 换 cookie 失败（试了 ${tokens.length} 个 token，最后 HTTP ${lastStatus}）——DSH 实例的 token 可能未落 ${this.tokenLog}，标准管道（dsh-control/重启）重启 DSH 可解`);
   }
 
   // ── 单发 RPC ───────────────────────────────────────────────────────────
@@ -286,7 +323,11 @@ export class NodeApiClient {
         // ⚠️ 2026-09-09：DSH 0.1.2 网关在 follow 大会话（>5MB）时存在竞态死锁
         // （resolveDescriptor → get 冻结）。跳过超过门槛的会话——quest 的 worker/fixer
         // 会话都是 KB 级，不受影响；大的是历史科研会话，不需要 quest 订阅。
-        const MAX_FOLLOW_SESSION_BYTES = 5 * 1024 * 1024;
+        // 2026-10-03:piml 会话 12.6MB 被旧限拦住 → 群回复静默丢失(用户实测)。
+        // 5MB 上限防的是 0.1.2 时代的 follow 竞态死锁——0.2.0 已无此 bug(实测 12MB 会话
+        // follow 正常);follow 风暴已由 RECENT_FOLLOW_LIMIT=60 治理,size 限制是冗余保护。
+        // 放宽到 50MB:足够容纳最大的科研会话,同时保留极端膨胀兜底。
+        const MAX_FOLLOW_SESSION_BYTES = 50 * 1024 * 1024;
         const safeToFollow = (id, cwd) => {
           try {
             const key = String(cwd || '').replace(/\\/g, '/').replace(/\/+$/, '').replace(/\//g, '-').replace(/:/g, '');
@@ -302,7 +343,13 @@ export class NodeApiClient {
         try {
           const resp = await this.sessions.list({});
           if (resp.result.ok && Array.isArray(resp.result.value?.items)) {
-            for (const item of resp.result.value.items) {
+            // 2026-09-30 follow 风暴断链:重连后曾对全部会话(2317 条)发起订阅,把
+            // 0.2.0 网关冻住(探针 000)→ 旧看护判死重启 → 桥再重连再风暴 = 重启死循环。
+            // 现在只补**最近活动**的 60 条(映射群主对话必在其中);新会话由 create
+            // 路径自动 follow,冷门旧会话等真被用到时再补。
+            const RECENT_FOLLOW_LIMIT = 60;
+            const sorted = [...resp.result.value.items].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+            for (const item of sorted.slice(0, RECENT_FOLLOW_LIMIT)) {
               const id = item.sessionId || item.session?.id || item.id;
               if (id && safeToFollow(id, item.cwd)) this.followSession(id);
             }

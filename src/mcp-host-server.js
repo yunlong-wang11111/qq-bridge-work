@@ -221,6 +221,85 @@ if (getHostConfig().allowProcessControl) {
       return { content: [{ type: 'text', text: JSON.stringify({ stopped: true, killed }) }] };
     }
   );
-}
+} // if (allowProcessControl) 到此为止——send_group_message 与进程控制无关,移到块外
+  //（2026-09-24 修:此前工具被困在这个 if 里,allowProcessControl=false 时根本不注册,kl 手里一直没有它）
+
+// ── send_group_message（2026-09-22）──────────────────────────────────────────
+// 主动向登记过的 QQ 群发消息：**不占对话正文**（只占一次工具调用），适合阶段汇报/通知。
+// 安全边界：群号必须在 config.json 的 groupWorkspaces 里登记过（防误发陌生群）。
+// 分条：文本里**单独一行的 ---** 会拆成多条发送（与桥的转发纪律一致）。
+server.tool(
+  'send_group_message',
+  '向指定 QQ 群发一条消息（主动汇报/通知用；比在对话里说一段省上下文）。群号必须是 config.json groupWorkspaces 里登记过的；文本中用单独一行的 --- 可分条发送。',
+  {
+    groupId: z.string().describe('目标 QQ 群号（必须是已登记的映射群）'),
+    text: z.string().describe('消息内容；用单独一行的 --- 分段会拆成多条发送'),
+  },
+  async ({ groupId, text }) => {
+    const cfg2 = getConfig();
+    const allowed = Object.keys(cfg2.groupWorkspaces || {});
+    const gid = String(groupId || '').trim();
+    if (!allowed.includes(gid)) {
+      return { content: [{ type: 'text', text: `拒绝：群 ${gid || '(空)'} 未在 groupWorkspaces 登记。已登记的群：${allowed.join(', ') || '(无)'}` }], isError: true };
+    }
+    let token = String(cfg2.consoleToken || '').trim();
+    if (!token) {
+      try { token = fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim(); } catch {}
+    }
+    if (!token) return { content: [{ type: 'text', text: '拒绝：读不到桥的控制台令牌（config.consoleToken 或 state/console-token）' }], isError: true };
+
+    const parts = String(text || '').split(/^[ \t]*---[ \t]*$/m).map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return { content: [{ type: 'text', text: '拒绝：消息为空' }], isError: true };
+    const sent = [];
+    for (const p of parts) {
+      try {
+        const r = await fetch('http://127.0.0.1:3100/api/send/group', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-console-token': token },
+          body: JSON.stringify({ groupId: gid, message: p }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) {
+          return { content: [{ type: 'text', text: `发送失败（第 ${sent.length + 1} 段）：${j.error || r.status}` }], isError: true };
+        }
+        sent.push(p.slice(0, 30));
+      } catch (e) {
+        return { content: [{ type: 'text', text: `发送异常（第 ${sent.length + 1} 段）：${String(e?.message || e).slice(0, 120)}` }], isError: true };
+      }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify({ ok: true, groupId: gid, sentCount: sent.length }) }] };
+  }
+);
+
+// ── send_file（2026-09-27）──────────────────────────────────────────────────
+// AI 把本地文件发到 owner 私聊或登记群(SnowLuma upload_*_file)。安全:owner/白名单群+本地路径+100MB。
+server.tool(
+  'send_file',
+  '把本地文件直接发到 QQ(owner 私聊或已登记的映射群)。适合:结果 csv/PDF/图、打包产物——比"在群里说路径"直接。',
+  {
+    target: z.enum(['private', 'group']).describe('private=发给 owner 私聊;group=发到登记群'),
+    id: z.string().describe('QQ 号或群号(群必须在 groupWorkspaces 登记)'),
+    path: z.string().describe('本地文件绝对路径(≤100MB)'),
+  },
+  async ({ target, id, path: filePath }) => {
+    const cfg2 = getConfig();
+    let token = String(cfg2.consoleToken || '').trim();
+    if (!token) { try { token = fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim(); } catch {} }
+    if (!token) return { content: [{ type: 'text', text: '拒绝：读不到桥控制台令牌' }], isError: true };
+    try {
+      const r = await fetch('http://127.0.0.1:3100/api/send/file', {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-console-token': token },
+        body: JSON.stringify({ target, ...(target === 'group' ? { groupId: id } : { userId: id }), path: filePath }),
+        signal: AbortSignal.timeout(120000),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.ok === false) return { content: [{ type: 'text', text: `发送失败:${j.error || r.status}` }], isError: true };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, sent: `${target}:${id}`, name: j.name, bytes: j.bytes }) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `发送异常:${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+);
 
 await server.connect(new StdioServerTransport());

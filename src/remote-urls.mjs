@@ -18,11 +18,12 @@ export function consoleUrl({ host, questToken, wsKey }) {
   return `${base}?token=${questToken}${wsKey ? `&ws=${wsKey}` : ''}`;
 }
 
-/** DSH 地址（同屏 / 直通） */
+/** DSH 地址（同屏 / 直通）—— 2026-10-13：同屏也带 token（DSH 重启后旧 cookie 失效，
+ *  用户实测裸 3081 会被挡 "authentication required"；带 token 打开一次即种新 cookie） */
 export function dshUrls({ host, dshToken }) {
   const h = host || '127.0.0.1';
   return {
-    mirror: `http://${h}:3081`,
+    mirror: dshToken ? `http://${h}:3081/?token=${dshToken}` : `http://${h}:3081`,
     direct: dshToken ? `http://${h}:3082/?token=${dshToken}` : null,
   };
 }
@@ -47,7 +48,7 @@ export function buildRemoteUrls({ vip, dshToken, questToken, wsKey, wsPath, rela
   L.push('');
 
   L.push('② DSH');
-  L.push(`   同屏（镜像工位画面，LAN 密码不变）：${d.mirror}`);
+  L.push(`   同屏（镜像工位画面）：${d.mirror}`);
   if (d.direct) L.push(`   直通（独立完整界面，无常驻负载）：${d.direct}`);
   else if (relayConflict) L.push(`   ⚠️ 直通中继异常：${relayConflict}——先用同屏门，或到电脑上 taskkill /PID <该 pid> /T /F 后再问一次`);
   else L.push('   直通中继未响应（已尝试自动拉起，稍后再问一次）');

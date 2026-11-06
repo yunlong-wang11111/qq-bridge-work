@@ -16,7 +16,7 @@ import { execFile, spawn } from 'node:child_process';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 // 2026-09-08 切换到 0.1.2+（@Remote 网关）客户端：认证（token→cookie）+ 斜杠路径单发
 // + remote.mux 事件流聚合。旧 dsh-client.js 保留用于回滚（配 0.1.1-rc.2）。
-import { NodeApiClient, unwrap, createTurnCollector } from './dsh-client-v2.mjs';
+import { NodeApiClient, unwrap, createTurnCollector, blocksToText } from './dsh-client-v2.mjs';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
@@ -230,7 +230,7 @@ function loadConfig() {
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
       provider: 'deepseek-official',
-      model: 'deepseek-v4-flash-vision-exp',
+      model: 'deepseek-flash',
       reasoningEffort: 'max',
       ...(file.dsh ?? {})
     },
@@ -250,6 +250,10 @@ function loadConfig() {
     },
     // 私聊/群聊均未配置白名单时是否放行所有（true 时启动会打警告）
     allowAllWhenEmpty: file.allowAllWhenEmpty === true,
+    // 2026-09-22：映射群 → 工作区主对话（群消息直连该工作区当前主对话，不走桥自建会话）。
+    // ⚠️ 本函数是白名单式构造——新增配置字段必须在这里显式保留，否则读不到（踩过一次）。
+    groupWorkspaces: (file.groupWorkspaces && typeof file.groupWorkspaces === 'object' && !Array.isArray(file.groupWorkspaces))
+      ? file.groupWorkspaces : {},
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
@@ -662,6 +666,30 @@ function extractMediaFromSegments(segments) {
   return media;
 }
 
+// ── QQ 文件落地（2026-09-27）：用户在 QQ 发的文件(非图片)下载存盘,AI 拿绝对路径自行处理──
+// 设计定稿:落地即终点——跑不跑由 AI 走现有工具链(quest_run 有门禁),不做"收到即执行"。
+// 直链取法:群文件 get_group_file_url / 私聊文件 get_private_file_url(SnowLuma 实测支持)。
+async function landQQFile(fileId, name, kind, numId, cfgRef) {
+  const action = kind === 'group' ? 'get_group_file_url' : 'get_private_file_url';
+  const httpUrl0 = String(cfgRef?.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+  const headers = { 'content-type': 'application/json', ...(cfgRef?.snowluma?.accessToken ? { authorization: `Bearer ${cfgRef.snowluma.accessToken}` } : {}) };
+  const body = kind === 'group' ? { group_id: Number(numId), file_id: fileId } : { user_id: Number(numId), file_id: fileId };
+  const r = await fetch(`${httpUrl0}/${action}`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(20000) });
+  const j = await r.json().catch(() => ({}));
+  const url = j?.data?.url;
+  if (!r.ok || !url) throw new Error(`取文件直链失败:${j?.wording || j?.message || r.status}`);
+  const inbox = path.join(STATE_DIR, 'inbox');
+  fs.mkdirSync(inbox, { recursive: true });
+  const safe = String(name || 'file').replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
+  const dest = path.join(inbox, `${Date.now().toString(36)}_${safe}`);
+  const res = await fetch(url, { signal: AbortSignal.timeout(180000) });
+  if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > 200 * 1024 * 1024) throw new Error('文件超过 200MB 上限');
+  fs.writeFileSync(dest, buf);
+  return { name, path: dest, bytes: buf.length };
+}
+
 function allowed(kind, id, cfg) {
   // OneBot 事件里的 id 可能是数字也可能是字符串（int64 序列化差异），统一转字符串比较。
   // 配置字段兼容单数（group/private）与复数（groups/privates）两种写法。
@@ -671,6 +699,64 @@ function allowed(kind, id, cfg) {
   const allowList = cfg.allow[kind] ?? cfg.allow[kind + 's'] ?? [];
   if (allowList.length > 0) return allowList.map(String).includes(s);
   return cfg.allowAllWhenEmpty;
+}
+
+// ── 映射群 → 工作区主对话（2026-09-22）─────────────────────────────────────────
+// 配置 cfg.groupWorkspaces: { "群号": "工作区绝对路径" }：该群的消息**直连**该工作区的
+// 当前主对话（不再经桥自建会话）。主对话从 quest 的登记表动态解析 ⇒ 翻页/接管自动跟随，
+// 群不用重拉、配置不用改。用户诉求原话："整一个能直接联系他的，而不是通过 ZCode 转述"。
+const QUEST_CONVERGE_STATE = path.join(os.homedir(), '.dsh', 'quests', 'converge-state.json');
+let mainSessionCache = { at: 0, map: new Map() };   // sessionId -> groupId（30s TTL）
+const mainGroupCollectors = new Map();              // sessionId -> turn collector（主对话回复转发用）
+
+// 群消息在会话里的识别前缀。**投递与回传判定共用同一个常量**：只有带此前缀的 user 消息
+// 才把该会话"当前回合"标记为群来源。（用户 2026-09-22 反馈："我在对话里面问的他也会发到qq"）
+const QQ_GROUP_PREFIX = '【QQ群消息·来自';
+// sessionId -> boolean：当前回合是否由群消息发起。仅在**群来源回合**里回传 assistant 输出，
+// 网页/手机端自己问的话留在网页端，不倒灌进群。
+const qqGroupTurn = new Map();
+/** 事件里的消息文本（user/message 是 data.content，assistant/message 是 data.message.content）。 */
+function eventText(data) {
+  const c = data?.content ?? data?.message?.content;
+  return blocksToText(c).trim();
+}
+
+/** 工作区路径归一化（与 quest 的 wsKey 规则一致：':' 与路径分隔符 → '-'）。 */
+function normWsKey(s) {
+  return String(s || '').trim().toLowerCase().replace(/[:\\/]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** 读 quest 登记表，解析某工作区当前的主对话 sessionId（找不到返回 ''）。 */
+function resolveMainSessionId(wsPath) {
+  try {
+    const st = JSON.parse(fs.readFileSync(QUEST_CONVERGE_STATE, 'utf8'));
+    const want = normWsKey(wsPath);
+    // ① 规范化后精确匹配（大小写不敏感）——登记表的 key 是原样大小写，必须逐条归一化比对，
+    //    否则会落到②的尾段匹配，而尾段可能命中别的变体（如 -mnt-c-…-code_kl / …-code_kl-_sweep）⇒ 投错工作区。
+    for (const [k, v] of Object.entries(st)) {
+      if (normWsKey(k) === want && v?.mainSessionId) return String(v.mainSessionId);
+    }
+    // ② 退化：按路径尾段匹配（末位兜底；仅当①无果时使用）
+    const tail = String(wsPath).split(/[\\/]/).filter(Boolean).pop()?.toLowerCase() || '';
+    if (tail) {
+      for (const [k, v] of Object.entries(st)) {
+        if (k.toLowerCase().endsWith(tail) && v?.mainSessionId) return String(v.mainSessionId);
+      }
+    }
+  } catch {}
+  return '';
+}
+
+/** 刷新"主对话 sessionId → 群号"映射（带 30s 缓存，翻页后最多半分钟跟随）。 */
+function refreshMainSessionMap(cfg) {
+  if (Date.now() - mainSessionCache.at < 30000 && mainSessionCache.map.size) return mainSessionCache.map;
+  const map = new Map();
+  for (const [gid, wsPath] of Object.entries(cfg.groupWorkspaces || {})) {
+    const sid = resolveMainSessionId(String(wsPath));
+    if (sid) map.set(sid, String(gid));
+  }
+  mainSessionCache = { at: Date.now(), map };
+  return map;
 }
 
 // 二代会话 key 规范化：只接受 group:正整数 / private:正整数，并去掉前导零，避免同一会话出现多个别名。
@@ -1269,6 +1355,8 @@ async function main() {
   for (const [key, sessionId] of Object.entries(state.sessions)) reverse.set(sessionId, key);
   const sessionPromises = new Map(); // key -> create promise（防并发重复创建）
   const promptQueues = new Map(); // key -> { queue: [], running: false }：每个 QQ 会话串行投递 DSH prompt，保证 turn 顺序
+  // 用户消息合并防抖缓冲（2026-10-13）：key -> { parts: [{promptText, media, messageId}], timer }
+  const userDebounceBuf = new Map();
 
   // 唤醒“防卡死”租约：正常应在 turn/end 时删除 pendingWakeKeys；若 DSH 接受了但一直没回合结束，
   // 30 分钟后强制解除 busy 标记，避免该会话永久无法被唤醒。
@@ -1349,6 +1437,9 @@ async function main() {
 
   /** 当前模式是否允许该会话进入 */
   function modeAllowed(key, kind, id, cfg, mode) {
+    // 2026-09-22：映射群（groupWorkspaces 里登记的）不受 closed-agent 限制——
+    // 它们是"直连工作区主对话"的专用通道，权限由群成员归属（用户自己建的群）保证。
+    if (kind === 'group' && cfg.groupWorkspaces && cfg.groupWorkspaces[String(id)]) return true;
     if (mode === 'closed-agent') {
       // 封闭 agent 模式：仅 owner 私聊
       return key === `private:${String(cfg.ownerQQ ?? '')}`;
@@ -1359,7 +1450,12 @@ async function main() {
 
   /** 当前模式下的会话预设 */
   function modePreset(key, mode, cfg) {
-    if (mode === 'closed-agent') return closedAgentPreset || 'router-standard';
+    if (mode === 'closed-agent') {
+      // 2026-10-04:qq-chat preset 已在 0.2.0 重新注册(自定义 preset via cordis.patch.yml)
+      // ——QQ 场景规则+人格回归,工具物理受限(无 bash/文件/子代理)。
+      const p = closedAgentPreset || 'router-standard';
+      return (p === 'standard' || p === 'router-standard') ? 'qq-chat' : p;
+    }
     // 二代仿真模式优先使用 socialV2.agentPreset；未配置时回退到默认聊天预设
     if (mode === 'reserved2') return cfg.socialV2?.agentPreset || cfg.agentPreset || undefined;
     return cfg.agentPreset || undefined;
@@ -1393,6 +1489,12 @@ async function main() {
             }
             const result = await deliverPrompt(key, item.promptText, { farewell: item.farewell, silent: item.silent, media: item.media ?? [] });
             if (!result.ok) {
+              // 永久性错误（如 session/attachment-invalid：模型不支持该附件）重试无意义，
+              // 且每轮补投都会再给用户发一条"未被接受"——丢弃该条（已通知过一次），继续补投后续。
+              if (/^session\/attachment-/.test(String(result.error || ''))) {
+                log(`补投遇永久性错误，丢弃该消息继续后续 (${key}): ${result.error}`);
+                continue;
+              }
               log(`补投失败 ${key}: ${result.error || '未知错误'}`);
               failed += 1;
               const rest = items.slice(i);
@@ -1555,6 +1657,129 @@ async function main() {
     dshCheckStarted = true;
     checkDsh();
     setInterval(checkDsh, 5000);
+    // ── 审批看护(2026-10-06 #2+#3):自动放行安全工具 + 转发需人决策到 QQ ──
+    // DSH 的工具审批只在网页弹窗,QQ 用户看不见 → AI 冻住。此看护每 30 秒扫一次:
+    //   ①安全工具(edit/read/write/bash/fs 等)→ 自动放行
+    //   ②未知/高危工具 → QQ 推送"❓需要你批准",你回"同意"/"拒绝"
+    async function getCurrCookie() {
+      if (!api.cookie) await api.sessions.list({});
+      return api.cookie || '';
+    }
+    const AUTO_APPROVE_TOOLS = new Set(['edit', 'read', 'write', 'bash', 'pwsh', 'fs', 'fs_search', 'ls', 'grep', 'glob', 'mcp', 'memory']);   // 2026-10-10 补 memory:当日两次过 5 分钟窗被卡(自己的记忆插件,低风险)
+    const approvalNotified = new Map(); // eventId -> notified ts
+    setInterval(async () => {
+      try {
+        // 通过 $events 流查审批
+        const ws = new WebSocket('ws://127.0.0.1:3080/api/remote.mux', { headers: { cookie: await getCurrCookie() } });
+        const pendings = [];
+        ws.onopen = () => ws.send(JSON.stringify({ type: 'open', streamId: 'aprv', endpoint: '$events', payload: { args: {} } }));
+        ws.onmessage = (e) => {
+          const f = JSON.parse(e.data);
+          if (f.type !== 'item' || !f.value) return;
+          const v = f.value;
+          if (v.event !== 'approval/request') return;
+          const tool = String(v.request?.toolName || v.args?.[0]?.toolName || '?');
+          const eventId = v.eventId;
+          if (!eventId || approvalNotified.has(eventId)) return;
+          pendings.push({ eventId, tool, agentId: v.agentId, request: v.request });
+        };
+        setTimeout(async () => {
+          ws.close();
+          for (const p of pendings) {
+            approvalNotified.set(p.eventId, Date.now());
+            const safe = AUTO_APPROVE_TOOLS.has(p.tool) || AUTO_APPROVE_TOOLS.has(p.tool.split('.')[0]);
+            if (safe) {
+              // 自动放行
+              try {
+                await fetch('http://127.0.0.1:3080/api/$events/result', {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json', cookie: await getCurrCookie() },
+                  body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method: '$events/result',
+                    payload: { args: { request: { clientId: p.agentId, eventId: p.eventId, outcome: { kind: 'result', value: { approved: true } } } } } })
+                });
+                log(`审批自动放行: ${p.tool} (${p.eventId.slice(0, 8)}…)`);
+              } catch (e) { log('审批放行失败:', e?.message); }
+            } else {
+              // 转发到 QQ
+              const agent = String(p.agentId || '').slice(8, 16);
+              sendToQQ(`private:${cfg.ownerQQ}`, `❓ AI 请求使用工具「${p.tool}」(会话 ${agent}…)。\n回复「同意」放行 / 回复「拒绝」阻止 / 不回则等 5 分钟自动过期。`).catch(() => {});
+              log(`审批转发QQ: ${p.tool} (${p.eventId.slice(0, 8)}…)`);
+            }
+          }
+          // 清理旧记录
+          const cutoff = Date.now() - 10 * 60 * 1000;
+          for (const [id, ts] of approvalNotified) if (ts < cutoff) approvalNotified.delete(id);
+        }, 3000);
+      } catch (e) { /* 查询失败静默 */ }
+    }, 30 * 1000).unref();
+
+    // ── quest 会话别名解析(2026-10-20)────────────────────────────────────
+    // worker/fixer/spawn 会话的 LLM 标题是同一段 workspace 介绍(全部撞名),
+    // 真实身份在 quest 账本: spawn.created→title, worker.session/fix.session→节点id。
+    // 扫账本建 sessionId→别名映射, 5 分钟缓存。
+    let questAliasCache = { at: 0, map: new Map() };
+    async function questSessionAlias(sessionId, cwdHint) {
+      if (!sessionId) return '';
+      try {
+        if (Date.now() - questAliasCache.at > 5 * 60 * 1000) {
+          const map = new Map();
+          const questsDir = path.join(os.homedir(), '.dsh', 'quests');
+          for (const dir of fs.readdirSync(questsDir, { withFileTypes: true })) {
+            if (!dir.isDirectory()) continue;
+            const ledger = path.join(questsDir, dir.name, 'ledger.jsonl');
+            let text = '';
+            try { text = fs.readFileSync(ledger, 'utf8'); } catch { continue; }
+            for (const line of text.split('\n')) {
+              if (!line.includes('"session')) continue;
+              let ev; try { ev = JSON.parse(line); } catch { continue; }
+              if (ev.t === 'spawn.created' && ev.sessionId) map.set(String(ev.sessionId), `spawn:${String(ev.title || '?').slice(0, 24)}`);
+              else if (ev.t === 'worker.session' && ev.sessionId) map.set(String(ev.sessionId), `总结:${String(ev.node || '?').slice(0, 24)}`);
+              else if (ev.t === 'fix.session' && ev.sessionId) map.set(String(ev.sessionId), `fixer:${String(ev.node || '?').slice(0, 24)}`);
+            }
+          }
+          questAliasCache = { at: Date.now(), map };
+        }
+        return questAliasCache.map.get(String(sessionId)) || '';
+      } catch { return ''; }
+    }
+
+    // ── 卡死看护(2026-10-05 第 2 层):每 5 分钟扫一遍 DSH 会话,
+    // 发现 running 但 >10 分钟零推进 → QQ 主动推送提醒(等审批/冻结)
+    // 2026-10-11 降噪(用户反馈"有点吵"): ①阈值 10→25 分钟(COMSOL 子对话等任务零推进是常态);
+    // ②该会话工作区在 quest 有节点在跑 → 大概率在等仿真结果,跳过不报;
+    // ③文案指令词修正:「状态」→「全貌」(全貌=/q总览;「状态」查的是单工作区任务线,词不达意)。
+    const stuckNotified = new Map(); // sessionId -> last notified ts
+    setInterval(async () => {
+      try {
+        const sess = await api.sessions.list({});
+        const running = (sess.result?.value?.items ?? []).filter((x) => x.running);
+        const now = Date.now();
+        for (const s of running) {
+          const idle = now - (s.updatedAt || 0);
+          if (idle < 25 * 60 * 1000) continue; // 不到 25 分钟不管
+          const last = stuckNotified.get(s.sessionId) || 0;
+          if (now - last < 30 * 60 * 1000) continue; // 同一会话 30 分钟最多提醒一次
+          // quest 有节点在跑 → 会话大概率在等仿真/长任务,零推进正常,跳过
+          try {
+            const st = await questCall('/api/status?ws=' + encodeURIComponent(String(s.cwd || '')));
+            if ((st.plan?.nodes ?? []).some((n) => n.status === 'running')) continue;
+          } catch {}
+          stuckNotified.set(s.sessionId, now);
+          const ws = String(s.cwd || '').split(/[\\/]/).filter(Boolean).pop() || '?';
+          // 2026-10-20: quest 自建会话(worker/fixer/spawn)的 LLM 标题全是同一句 workspace 介绍
+          // ("你在工作区 xxx",用户反馈 99% 撞名)——先查账本拿真实身份,查不到才退回 projections 标题。
+          const alias = await questSessionAlias(s.sessionId, String(s.cwd || ''));
+          const title = (alias || s.projections?.values?.title || s.sessionId?.slice(10, 18) || '?').slice(0, 30);
+          const mins = Math.round(idle / 60000);
+          sendToQQ(`private:${cfg.ownerQQ}`, `⚠️ 卡死看护:DSH 会话「${ws}:${title}」在跑但已 ${mins} 分钟零推进——排除了"在等 quest 任务"的情况,可能在等审批或已冻结。\n发「全貌」看全景;发「取消」可中断该回合。`).catch(() => {});
+          log(`卡死看护: ${s.sessionId?.slice(0, 20)} idle ${mins}min alias=${alias || '(无)'}`);
+        }
+        // 清理已恢复的
+        for (const [id] of stuckNotified) {
+          if (!running.find((x) => x.sessionId === id)) stuckNotified.delete(id);
+        }
+      } catch {}
+    }, 5 * 60 * 1000).unref();
   }
 
   // ── 本地控制台（独立 Web 面板，不依赖 DSH WebUI） ───────────────────────────
@@ -4337,6 +4562,41 @@ async function main() {
           }
           return;
         }
+        if (req.method === 'POST' && url.pathname === '/api/send/file') {
+          // 2026-09-27 AI→QQ 发文件:owner 私聊或 groupWorkspaces 白名单群;本地绝对路径,≤100MB
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const target = String(body.target ?? body.kind ?? 'private');
+          const tid = String(body.userId ?? body.groupId ?? '').trim();
+          const filePath = String(body.path ?? '').trim();
+          if (!tid || !filePath) { sendJson({ ok: false, error: '缺少 userId/groupId 或 path' }, 400); return; }
+          if (target === 'group' && !Object.keys(cfg.groupWorkspaces || {}).includes(tid)) { sendJson({ ok: false, error: `群 ${tid} 未在 groupWorkspaces 登记` }, 403); return; }
+          if (target !== 'group' && String(tid) !== String(cfg.ownerQQ)) { sendJson({ ok: false, error: '文件发送仅限 owner 私聊或登记群' }, 403); return; }
+          if (!/^[a-z]:[\\/][^<>:"|?*]+$/i.test(filePath)) { sendJson({ ok: false, error: '仅支持本地盘绝对路径' }, 400); return; }
+          try {
+            const st = fs.statSync(filePath);
+            if (!st.isFile()) { sendJson({ ok: false, error: '不是文件' }, 400); return; }
+            if (st.size > 100 * 1024 * 1024) { sendJson({ ok: false, error: '超过 100MB' }, 413); return; }
+            const httpUrl0 = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const action = target === 'group' ? 'upload_group_file' : 'upload_private_file';
+            const payload = target === 'group'
+              ? { group_id: Number(tid), file: filePath, name: path.basename(filePath) }
+              : { user_id: Number(tid), file: filePath, name: path.basename(filePath) };
+            const r0 = await fetch(`${httpUrl0}/${action}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+              body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(120000),
+            });
+            const j0 = await r0.json().catch(() => ({}));
+            if (!r0.ok || j0?.status !== 'ok' || j0?.retcode !== 0) throw new Error(j0?.wording || j0?.message || `HTTP ${r0.status}`);
+            sendJson({ ok: true, to: `${target}:${tid}`, name: path.basename(filePath), bytes: st.size });
+          } catch (e) {
+            log('文件发送失败:', e?.message ?? e);
+            sendJson({ ok: false, error: String(e?.message ?? e).slice(0, 160) }, 502);
+          }
+          return;
+        }
         if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {
           const body = await readBody();
           const token = String(body.token ?? '').trim();
@@ -4906,8 +5166,10 @@ async function main() {
     return null;
   }
 
-  const MAX_MEDIA_COUNT = 5; // 单条消息最多内联/返回的图片/表情数
-  const MAX_MEDIA_BYTES = 4 * 1024 * 1024; // 单条消息图片总字节上限（与 safeFetchBuffer 默认一致）
+  const MAX_MEDIA_COUNT = Number(cfg.maxMediaCount ?? 8); // 单条最多图片/表情数（2026-10-13 5→8, 防抖合并后多图并一条）
+  // 2026-10-13 调大（4MB→10MB, cfg.maxMediaMb 可调）：消息防抖合并上线后, 连发几条的图会
+  // 并成一条投递, 4MB 总量轻松被几张截图顶爆（实测"图片总大小超限已跳过"）。
+  const MAX_MEDIA_BYTES = Number(cfg.maxMediaMb ?? 10) * 1024 * 1024;
   const MAX_MEDIA_PIXELS = 64_000_000; // 单张图片像素上限，防止“图片炸弹”解码拖垮 DSH
   const MAX_MEDIA_STORE_PER_KEY = 500; // 每个会话最多缓存多少条消息的媒体元数据，防止无限增长
 
@@ -5259,8 +5521,9 @@ async function main() {
     return true;
   }
 
-  // 视觉模型应用去重：每个 DSH 会话在本进程内只 selectModel 一次。
-  // 四种 QQ 模式共用 DSH 会话，统一强制使用 DeepSeek-V4-Flash-Vision-Exp + max 思考强度。
+  // 会话模型统一设置：每个 DSH 会话在本进程内只 selectModel 一次。
+  // 2026-09-29 修正：deepseek-flash（V4.1）目录声明即原生多模态，vision-exp 已废弃——
+  // 此前绑到 vision-exp 导致首张图片被 DSH 拒收（session/attachment-invalid）。
   const visionModelAppliedSessions = new Set();
   async function ensureVisionModel(sessionId) {
     if (visionModelAppliedSessions.has(sessionId)) return;
@@ -6055,6 +6318,52 @@ async function main() {
   }
 
   // 实际的 DSH prompt 投递（不再直接对外暴露，统一走 promptQueues 串行队列）。
+  // 2026-10-13 用户消息合并防抖（通用）：push 进缓冲，静默 cfg.userDebounceSec（默认 30s）后合并投递。
+  // deliver 回调存于每条 part 上（同 key 必为同一通道）；QQ 撤回按 messageId 剔除（见 onNotice）。
+  function pushUserDebounce(key, promptText, media, messageId, deliver) {
+    let db = userDebounceBuf.get(key);
+    if (!db) userDebounceBuf.set(key, (db = { parts: [], timer: null }));
+    db.parts.push({ promptText, media: media ?? [], messageId, deliver });
+    if (db.timer) clearTimeout(db.timer);
+    db.timer = setTimeout(async () => {
+      const parts = db.parts;
+      userDebounceBuf.delete(key);
+      if (!parts.length) return;
+      const merged = parts.length === 1
+        ? parts[0].promptText
+        : parts.map((p, i) => `【第${i + 1}条】\n${p.promptText}`).join('\n\n');
+      const mergedMedia = parts.flatMap((p) => p.media ?? []);
+      if (parts.length > 1) log(`[防抖] ${key} 合并 ${parts.length} 条消息投递`);
+      try {
+        await parts[parts.length - 1].deliver(merged, mergedMedia);
+      } catch (e) {
+        log(`[防抖] 合并投递异常 ${key}: ${e?.message ?? e}`);
+      }
+    }, Number(cfg.userDebounceSec ?? 30) * 1000);
+  }
+
+  // 映射群 → 主对话直连投递（2026-10-13 从消息 handler 抽出，防抖 flush 与直通共用）
+  async function deliverGroupMain(key, mainSid, textWithPrefix, mediaList) {
+    try {
+      // 2026-10-23 用户要求：投给主对话的每条 QQ 消息尾部带一次回传指引（防抖合并后也只带一次）——
+      // 正常回复文本会自动转回群；若没转出去（非 QQ 来源回合等场景），让 AI 知道用工具补发，别让手机侧断流。
+      const qqEchoHint = '\n\n（↑这条来自手机QQ，群号见前缀。你的回复正文会自动转发回该群——直接正常写给群友看即可；'
+        + '如果上一条回复没有出现在群里，用 qq_send_group_message 工具把要说的话发到前缀里的群号，别只在网页侧说。）';
+      const groupContent = [{ type: 'text', text: textWithPrefix + qqEchoHint }];
+      if (Array.isArray(mediaList) && mediaList.length > 0) {
+        const imageParts = await resolveMediaList(mediaList).catch(() => []);
+        groupContent.push(...imageParts);
+      }
+      await api.sessions.prompt({ sessionId: mainSid, mode: 'queue', content: groupContent });
+      qqGroupTurn.set(mainSid, true);
+      appendActivity(`${key} → 主对话 ${String(mainSid).slice(8, 16)}：${textWithPrefix.slice(0, 80)}`);
+      log(`映射群消息 → 主对话 ${String(mainSid).slice(8, 16)}（${key}）`);
+      try { api.followSession(mainSid); } catch {}
+    } catch (e) {
+      await sendToQQ(key, `⚠️ 投递主对话失败：${String(e?.message || e).slice(0, 120)}`).catch(() => {});
+    }
+  }
+
   async function deliverPromptNow(key, promptText, opts = {}) {
     if (!dshReady) {
       const items = queued.get(key) ?? [];
@@ -7325,6 +7634,19 @@ async function main() {
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
+    // 2026-09-27 文件落地(私聊/映射群共用):QQ 发来的文件下载到 state/inbox,把绝对路径写进消息文本
+    const fileNoteParts = [];
+    const fileSegs = (event.message ?? []).filter((s) => s?.type === 'file' && s?.data).map((s) => ({
+      fileId: String(s.data.file_id ?? s.data.id ?? s.data.fid ?? ''),
+      name: String(s.data.file_name ?? s.data.name ?? s.data.filename ?? 'file'),
+    })).filter((f) => f.fileId);
+    for (const f of fileSegs.slice(0, 3)) {
+      try {
+        const landed = await landQQFile(f.fileId, f.name, kind, id, cfg);
+        fileNoteParts.push(`📎 收到文件「${landed.name}」(${Math.max(1, Math.round(landed.bytes / 1024))}KB),已存本地:${landed.path}`);
+      } catch (e) { log('文件落地失败:', e?.message ?? e); fileNoteParts.push(`⚠️ 文件「${f.name}」落地失败:${String(e?.message ?? e).slice(0, 80)}`); }
+    }
+    const fileNote = fileNoteParts.join('\n');
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];
@@ -7348,6 +7670,71 @@ async function main() {
     if (!plainContent && !quoteTargetIsSelf) return;
     const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
     const roleState = readRoleState();
+
+    // ── 映射群：直连工作区主对话（2026-09-22 新增；原有群聊逻辑完全不变）──
+    // 群在 cfg.groupWorkspaces 里 ⇒ 消息投给该工作区的**当前主对话**（动态解析，翻页自动跟随）。
+    // 2026-10-27：owner 的 / 管理命令（如 /q翻页）不投给主对话（会被当聊天内容、费 token 且依赖
+    // AI 理解）——放行漏到下方命令块，桥硬通道直达。在哪个群发都一样了。
+    if (kind === 'group' && cfg.groupWorkspaces && cfg.groupWorkspaces[String(id)]
+        && !(isOwner && typeof plainContent === 'string' && plainContent.startsWith('/'))) {
+      const wsPath = String(cfg.groupWorkspaces[String(id)]);
+      let mainSid = resolveMainSessionId(wsPath);
+      // 2026-10-27 自动换届：翻页后无主对话——自动建带经理人设（main-researcher）的会话，
+      // 把换届说明+用户原消息一起投给它（原消息 QQ 前缀保持开头 ⇒ 它的回应自动转回群），
+      // 上任清单里让它自己 quest_register_main。人设创建失败（preset 未验证/版本不兼容）
+      // 时降级裸建并告警，换届功能不被 preset 阻塞。
+      if (!mainSid) {
+        let presetNote = '（人设=main-researcher）';
+        try {
+          let created = await api.sessions.create({ cwd: wsPath, agentPreset: 'main-researcher' });
+          if (!created?.result?.value?.sessionId) {
+            created = await api.sessions.create({ cwd: wsPath });
+            presetNote = '（⚠️ main-researcher 人设创建失败，已降级标准模式——请让 zcode:glm 验证 preset）';
+          }
+          mainSid = created?.result?.value?.sessionId;
+        } catch (e) {
+          mainSid = null;
+          log('[自动换届] 建会话异常:', e?.message ?? e);
+        }
+        if (!mainSid) {
+          await sendToQQ(key, '⚠️ 自动换届失败（建会话异常）——请在 DSH 网页手动开会话并让它 quest_register_main。').catch(() => {});
+          return;
+        }
+        log(`[自动换届] ${key} 无主对话 → 已自动建 ${String(mainSid).slice(8, 16)} ${presetNote}`);
+        appendActivity(`${key} 自动换届：新建主对话 ${String(mainSid).slice(8, 16)} ${presetNote}`);
+        // 2026-11-02 机器注册主对话（治"AI自觉注册不可靠"——管道工作区 18 会话零注册，
+        // 假id session-main 进注册表导致全群投递失败）：桥直接写 converge-state.json。
+        // quest 每次 loadConvergeState 读盘，写完即生效；失败不阻塞（仍靠 AI 自注册兜底）。
+        try {
+          const csPath = path.join(os.homedir(), '.dsh', 'quests', 'converge-state.json');
+          const st = JSON.parse(fs.readFileSync(csPath, 'utf8'));
+          const wsKey = String(wsPath).replace(/[:\\\/]+/g, '-');
+          st[wsKey] = st[wsKey] || {};
+          st[wsKey].mainSessionId = mainSid;
+          st[wsKey].mainAt = new Date().toISOString();
+          fs.writeFileSync(csPath, JSON.stringify(st, null, 1));
+          log(`[自动换届] 已机器注册 ${wsKey} -> ${String(mainSid).slice(8, 16)}`);
+        } catch (e) {
+          log('[自动换届] 机器注册失败（退回 AI 自注册兜底）:', e?.message ?? e);
+        }
+        const bootSuffix = `\n\n（系统·自动换届：本工作区检测不到主对话，已为你自动创建会话${presetNote}，你的会话ID是 ${mainSid}，主对话注册已由系统代完成。上任清单：先读工作区 research-state.md 与 verified/INDEX.md（如有），然后正常回应用户上面这条消息。）`;
+        // 带换届说明投递后直接 return——本轮不走下面的常规防抖/直投（消息已消费）
+        await deliverGroupMain(key, mainSid, `${QQ_GROUP_PREFIX}${isOwner ? '用户' : `群成员 ${event.user_id}`}·群${id}】${plainContent}${fileNote ? '\n' + fileNote : ''}${bootSuffix}`, mediaList);
+        return;
+      }
+      // 2026-10-13 防抖同款：映射群里管理员的连续消息（文字/图/补充）也攒静默期合并投主对话
+      if (isOwner && cfg.userDebounceGroup !== false) {
+        pushUserDebounce(key, `${QQ_GROUP_PREFIX}${isOwner ? '用户' : `群成员 ${event.user_id}`}·群${id}】${plainContent}${fileNote ? '\n' + fileNote : ''}`,
+                         mediaList, event.message_id, async (merged, mergedMedia) => {
+          await deliverGroupMain(key, mainSid, merged, mergedMedia);
+        });
+        return;
+      }
+      await deliverGroupMain(key, mainSid,
+        `${QQ_GROUP_PREFIX}${isOwner ? '用户' : `群成员 ${event.user_id}`}·群${id}】${plainContent}${fileNote ? '\n' + fileNote : ''}`,
+        mediaList);
+      return;
+    }
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
     // 审批只有管理员消息会被消费；群友消息不能因为“审批挂起”而被吞掉，应继续走正常处理。
@@ -7497,7 +7884,8 @@ async function main() {
       + (kind === 'group'
         ? `${event.sender?.card || event.sender?.nickname || String(event.user_id)}：${textContent}`
         : textContent)
-      + mediaHintFor(key, messageRef, mediaList);
+      + mediaHintFor(key, messageRef, mediaList)
+      + (fileNote ? '\n' + fileNote : '');
 
     appendActivity(`${key} ${isOwner ? '管理员' : '群友'} ${event.sender?.nickname || event.user_id}：${textContent.slice(0, 80)}`);
 
@@ -7579,6 +7967,23 @@ async function main() {
       return;
     }
 
+    // ── 用户消息合并防抖（2026-10-13 用户需求）──────────────────────────────
+    // 管理员私聊的连续消息（打字分段/补充/配图）攒一个静默期再合并成一条投递——
+    // 避免逐条触发多个 DSH 回合（打断/烧 token）。命令类消息在更早分支已 return，不受影响。
+    // 窗口秒数：config 的 userDebounceSec（默认 30）。群聊默认同样开启（只缓冲管理员自己的
+    // 消息，群友消息直通不受影响）；config 的 userDebounceGroup: false 可只保留私聊防抖。
+    if (isOwner && (kind === 'private' || cfg.userDebounceGroup !== false)) {
+      pushUserDebounce(key, promptText, mediaList, event.message_id,
+        async (merged, mergedMedia) => { await deliverUserTurn(key, merged, mergedMedia); });
+      appendActivity(`${key} 管理员消息进防抖缓冲`);
+      return;
+    }
+
+    await deliverUserTurn(key, promptText, mediaList);
+  }
+
+  // 正常模式的对话投递（原消息 handler 尾段抽出，2026-10-13：防抖 flush 与直通共用）
+  async function deliverUserTurn(key, promptText, mediaList) {
     // DSH 重启容错：DSH 不可用时消息入队（不丢），恢复后自动补投
     if (!dshReady) {
       const items = queued.get(key) ?? [];
@@ -7630,6 +8035,12 @@ async function main() {
     }
     if (cfg.ackMessage && currentMode !== 'reserved2') await sendToQQ(key, cfg.ackMessage);
     log(`已投递 ${key}: ${promptText.slice(0, 80)}${promptText.length > 80 ? '…' : ''}`);
+    // 2026-10-07 修（私聊回复丢失事故）:私聊路径补上群路径 2026-10-05 的同款补丁——
+    // 投递成功即显式 followSession。事故链:DSH 中午重启 → mux 订阅集合随时间漂移 →
+    // 私聊会话(低频活跃)掉出集合 → 23:10 投递后 AI 7 秒答完,但 mux 没流它的事件 →
+    // turn collector 无感 → 回复永远不进 QQ(会话记录里明明有完整回复)。
+    // followSession 幂等,已 follow 就跳过;群路径 7615 行同款。
+    try { api.followSession(sessionId); } catch {}
   }
 
   // 取消/拒绝一个挂起的提问或审批，并给 DSH 回执（超时、被新请求覆盖时使用）
@@ -7801,6 +8212,55 @@ async function main() {
         for await (const envelope of api.events.mux({})) {
           const frame = envelope.payload;
           if (frame.type === 'session/event') {
+            // ── 映射群：主对话的输出 → 转发到群（2026-09-22 新增；原有转发逻辑不变）──
+            // **逐条转发**（用户 2026-09-22 定稿）：他的每段输出单独发一条 QQ 消息——
+            // "说一句 → 干活 → 再说一句"就是两条，QQ 的字数限制下比合并成长文好读。
+            // 过滤：只发 assistant/message 里的文本块（工具调用块不含文本、自动跳过）；
+            // 流式分块 assistant/chunk 忽略（与 message 内容重复）。主对话身份每 30s 刷新 ⇒ 翻页自动跟随。
+            // **来源闸门**（2026-09-22 修）：只回传"由群消息发起的回合"。判定靠 QQ_GROUP_PREFIX——
+            // 群里来的消息带前缀 ⇒ 该回合 arm；网页/手机端自己问的没前缀 ⇒ 该回合 disarm；
+            // 回合结束自动清（插件通知、定时任务等来源的回合不会误回传）。
+            const mainGid = refreshMainSessionMap(cfg).get(frame.sessionId);
+            if (mainGid) {
+              const ev = frame.event;
+              const sid = frame.sessionId;
+              if (ev?.type === 'user/message') {
+                const t = eventText(ev.data);
+                const k = ev.data?.source?.kind;
+                // 2026-10-25（"合并消息回复断流"事故）：防抖合并多条时文本开头是「【第1条】」
+                // 而非 QQ 前缀 ⇒ startsWith 判不中 ⇒ disarm ⇒ 主对话回复落网页不转群（用户在
+                // 手机侧断流大半天）。修：合并格式里每条段首仍带 QQ 前缀，按段首匹配一并认。
+                if (t.startsWith(QQ_GROUP_PREFIX) || t.includes('\n【QQ群消息·来自')) {
+                  qqGroupTurn.set(sid, true);            // 群消息 ⇒ 本回合回传
+                } else if (t.startsWith('【全线收敛')) {
+                  // 2026-09-23（"主对话不知道收敛了"事故）：quest 的收尾通知没有 QQ 前缀,闸门原样
+                  // disarm ⇒ 主对话对收尾的回复(阶段汇总——正是用户要在群里看的)只落网页。
+                  // 收尾通知 ⇒ 武装回传;回执/失败上报保持网页侧(逐条进群就是轰炸)。
+                  qqGroupTurn.set(sid, true);
+                } else if (t.startsWith('<system-reminder')) {
+                  // 系统注入（AGENTS.md 更新等，kind=agent-instructions）：不代表来源，不动判定，
+                  // 否则会把同一回合里的群消息误 disarm。实测它紧跟群消息之后出现。
+                } else if (k === 'speak-up') {
+                  // 2026-10-23（鱼上线）：dsh-speak-up 主动搭话触发的回合——鱼自己想开口，
+                  // 这正是要在 QQ 里看到的话，arm 回传（与【全线收敛】同款特判）。
+                  qqGroupTurn.set(sid, true);
+                } else if (k === undefined || k === 'user') {
+                  qqGroupTurn.set(sid, false);           // 网页/手机端自己打的字 ⇒ 不回传
+                }
+                // 其余来源（plugin/*、subagent-settled、agent-message）不表态，交给 turn/end 清。
+              } else if (ev?.type === 'turn/end') {
+                qqGroupTurn.set(sid, false);
+              } else if (ev?.type === 'assistant/message' && qqGroupTurn.get(sid) === true) {
+                const raw = eventText(ev.data);
+                // 分条纪律（2026-09-22 用户定稿）：主对话在 QQ 场景可用**单独一行的 ---** 分段，
+                // 桥按它拆成多条短消息发送（QQ 有字数限制，分条比长文好读）。
+                const parts = raw ? raw.split(/^[ \t]*---[ \t]*$/m).map((s) => s.trim()).filter(Boolean) : [];
+                for (const p of parts) {
+                  await sendToQQ(`group:${mainGid}`, p).catch((e) => log('主对话→群转发失败:', e?.message ?? e));
+                }
+              }
+              continue;
+            }
             const key = reverse.get(frame.sessionId);
             if (!key) {
               // 黑话学习会话：只收集 turn，不发送 QQ，并唤醒等待中的学习任务。
@@ -8319,9 +8779,11 @@ async function main() {
       return ['【quest 命令】（也可直接用自然语言让 AI 查）',
         '/q网址 [工作区关键词] — 远程访问地址：控制台（带 token+ws）+ DSH（同屏 3081 / 直通 3082）',
         '/q状态 — 任务线全景（最近活跃工作区，零 token）',
+        '/q总览 — 跨工作区总览（在跑/静默/收尾开关；发"总览"或"晨报"同效）',
         '/q派发 <节点> — 派发/重派某节点',
         '/q停 <节点> [原因] — 人工终止（不触发自动修复）',
         '/q翻页 [工作区] — 翻页：写交接→归档→开新会话（控制台右上也有翻页按钮；对话里也可让 AI 调 quest_flip）',
+        '/q收尾 [工作区] [开|关|现在] — 自动收尾开关（默认开；现在=一次性总结不改开关）',
         '/q确认 <id> — 放行 quest_run 门禁挂起的命令',
         '/q拒绝 <id> — 作废挂起的命令（从未执行）',
         '/q续跑 [节点] — 从断点续跑被中断的节点（无参数=全部）',
@@ -8331,10 +8793,45 @@ async function main() {
       const d = await questCall('/api/status');
       if (d.error) return `quest 不可用：${d.error}`;
       const nodes = d.plan?.nodes ?? [];
-      if (!nodes.length) return '当前没有任务线。';
-      const lines = nodes.map((n) => `${n.status === 'running' ? '▶' : n.status === 'completed' ? '✅' : n.status === 'failed' ? '❌' : n.status === 'cancelled' ? '🛑' : n.status === 'frozen' ? '⛔' : n.status === 'skipped' ? '⏭' : '·'} ${n.id}: ${n.status}${n.verdict && n.verdict !== n.status ? `（${n.verdict}）` : ''}${n.metrics?.loss_last != null ? ` loss=${n.metrics.loss_last}` : ''}`);
+      const questRunning = nodes.filter((n) => n.status === 'running').length;
+      const lines = nodes.map((n) => `${n.status === 'running' ? '▶' : n.status === 'completed' ? '✅' : n.status === 'failed' ? '❌' : n.status === 'cancelled' ? '🛑' : n.status === 'frozen' ? '⛔' : n.status === 'skipped' ? '⏭' : n.status === 'draft' ? '📝' : '·'} ${n.id}: ${n.status}${n.intent ? `（待施工：${String(n.intent).slice(0, 24)}）` : ''}${n.verdict && n.verdict !== n.status ? `（${n.verdict}）` : ''}${n.metrics?.loss_last != null ? ` loss=${n.metrics.loss_last}` : ''}`);
       const unread = (d.unread ?? []).map((u) => `📣 ${u.node}:${u.verdict}`).join('\n');
-      return `${d.plan.title || d.plan.workspace || ''}\n${lines.join('\n')}${unread ? `\n${unread}` : ''}`.slice(0, 900);
+      // 2026-10-10：外部 harness 登记的任务（quest_track）——ZCode/GLM 等不在 quest 执行车道里的活
+      const ext = (d.external ?? []).map((t) => `🧩 [${t.source}] ${t.title}${t.note ? `｜${t.note}` : ''}${t.stale ? '（超6h未更新）' : ''}`).join('\n');
+      // 2026-10-05 改进:检查**全部**在跑的 DSH 会话(不限本工作区,含 spawn 工人)
+      let dshNote = '';
+      try {
+        const sess = await api.sessions.list({});
+        const items = sess.result?.value?.items ?? [];
+        const running = items.filter((x) => x.running);
+        if (running.length > 0) {
+          const names = running.map((x) => {
+            const ws = String(x.cwd || '').split(/[\\/]/).filter(Boolean).pop() || '?';
+            const t = x.projections?.values?.title || '';
+            return `${ws}:${t.slice(0, 14) || x.sessionId?.slice(10, 18) || '?'}`;
+          }).join('、');
+          dshNote = `\n📊 DSH ${running.length} 个会话在跑: ${names}${questRunning === 0 ? '\n⚠️ 任务线安静但 DSH 在跑——可能在等审批/选择题,或卡住了。发「取消」可中断。' : ''}`;
+        }
+      } catch {}
+      return `${d.plan.title || d.plan.workspace || ''}\n${lines.join('\n')}${unread ? `\n${unread}` : ''}${ext ? `\n${ext}` : ''}${dshNote}`.slice(0, 1200);
+    }
+    // /q总览（2026-09-20 用户需求）：跨工作区一览——在跑/静默/静默时长/收尾开关，治"不放心"。
+    if (head === '/q总览') {
+      const wl = await questCall('/api/workspaces');
+      if (wl.error) return `quest 不可用：${wl.error}`;
+      const list = (wl.workspaces || []).filter((w) => !w.junk);
+      if (!list.length) return 'quest 里没有工作区。';
+      const rows = await Promise.all(list.map(async (w) => {
+        const s = await questCall(`/api/status?ws=${encodeURIComponent(w.wsKey)}`);
+        if (s.error) return `❓ ${w.wsKey.slice(-20)}（读取失败）`;
+        const running = (s.plan?.nodes ?? []).filter((n) => n.status === 'running').length;
+        const total = (s.plan?.nodes ?? []).length;
+        const line = s.line || {};
+        const qm = line.quietMinutes ?? line.idleMinutes;
+        const quietTxt = running > 0 ? `▶ ${running} 节点在跑` : line.quiet ? `🌙 静默${qm != null ? ' ' + Math.round(qm) + ' 分钟' : ''}` : line.ws?.recent ? `📝 有文件改动（${line.ws.recent} 个，最新 ${line.ws.latest?.name || '?'}）` : '· 空闲';
+        return `${running > 0 ? '🔥' : line.quiet ? '🌙' : '·'} ${w.title || w.wsKey.slice(-24)}：${quietTxt}（${total} 节点）｜收尾${s.convergeAuto === false ? '关❌' : '开✅'}`;
+      }));
+      return ['📊 quest 总览（跨工作区）', ...rows].join('\n').slice(0, 1200);
     }
     if (head === '/q派发' && arg1) {
       const d = await questCall('/api/dispatch', { method: 'POST', body: JSON.stringify({ node: arg1 }) });
@@ -8343,6 +8840,47 @@ async function main() {
     if (head === '/q停' && arg1) {
       const d = await questCall('/api/cancel', { method: 'POST', body: JSON.stringify({ node: arg1, reason: argRest || 'QQ 人工终止' }) });
       return d.ok ? `已终止 ${arg1}（cancelled 终态，不触发自动修复）` : `终止失败：${d.error}`;
+    }
+    // /q取消（2026-10-04；2026-11-02 重写：原实现调臆造的 api.sessions.cancel——
+    // DSH API 根本没有回合取消 RPC（session/steer 只是消息队列操作），该路径从未可用。
+    // 现按真实能力分流：挂审批 → $events/result 拒绝解卡；纯僵死 → 如实报告需重启 DSH。
+    if (head === '/q取消') {
+      try {
+        const sess = await api.sessions.list({});
+        const items = (sess.result?.value?.items ?? []).filter((x) => x.running);
+        if (!items.length) return '当前没有在跑的 DSH 会话（都空闲）。';
+        const target = items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+        // ① 先试拒绝挂起的审批/提问事件（等审批是卡死的常见形态）
+        const r2 = await fetch('http://127.0.0.1:3080/api/$events/result', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', cookie: api.cookie || '' },
+          body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method: '$events/result',
+            payload: { args: { request: { clientId: target.sessionId, eventId: 'latest', outcome: { kind: 'result', value: { approved: false } } } } } })
+        });
+        const j2 = await r2.json();
+        if (j2.result?.ok) return `✅ 已拒绝「${String(target.projections?.values?.title || target.sessionId?.slice(10, 18)).slice(0, 24)}」挂起的最近事件（审批/提问），回合应随之解锁。若它继续推进可发消息引导收尾。`;
+        // ② 没有可解的事件 = 回合僵死（模型流断连），DSH 无取消 API
+        return `⚠️ 「${String(target.projections?.values?.title || '?').slice(0, 24)}」（${String(target.cwd || '').split(/[\\/]/).pop()}）没有挂起的审批/提问事件可拒绝——回合是真僵死（DSH API 无取消手段）。解法：重启 DSH（僵死回合随进程终止，会话恢复空闲；重派任务即续）。`;
+      } catch (e) { return `取消异常：${e?.message ?? e}`.slice(0, 120); }
+    }
+    // /q同意 & /q拒绝（2026-10-06）：QQ 远程审批——回复审批看护推送的 ❓ 消息
+    if (head === '/q同意' || head === '/q拒绝') {
+      const approve = head === '/q同意';
+      try {
+        // 找最近 running 的会话,通过 $events 找它的 pending 审批
+        const sess = await api.sessions.list({});
+        const items = (sess.result?.value?.items ?? []).filter((x) => x.running);
+        if (!items.length) return '当前没有在跑的会话,没有待审批的请求。';
+        const target = items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+        const r2 = await fetch('http://127.0.0.1:3080/api/$events/result', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', cookie: api.cookie || '' },   // 2026-10-10 修:getCurrCookie 定义在审批看护块作用域,此处不可见("同意异常:getCurrCookie is not defined")。上一行 sessions.list 已焐热 api.cookie,直接用。
+          body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method: '$events/result',
+            payload: { args: { request: { clientId: target.sessionId, eventId: 'latest', outcome: { kind: 'result', value: { approved } } } } } })
+        });
+        const j2 = await r2.json();
+        return j2.result?.ok ? `✅ 已${approve ? '同意' : '拒绝'}审批请求。` : `操作失败：${JSON.stringify(j2.result?.error || {}).slice(0, 80)}`;
+      } catch (e) { return `${approve ? '同意' : '拒绝'}异常：${e?.message ?? e}`.slice(0, 120); }
     }
     // 一键续跑（v0.5）：重派被中断的节点，quest 自带断点注入
     if (head === '/q续跑') {
@@ -8358,23 +8896,79 @@ async function main() {
       const d = await questCall('/api/gate/decide', { method: 'POST', body: JSON.stringify({ id: arg1, approve: false }) });
       return d.ok ? `已作废 ${arg1}（命令从未执行）` : `作废失败：${d.error}`;
     }
+    // /q收尾（2026-09-16 定稿 buff 式）：自动收尾开关。
+    //   /q收尾        → 显示当前状态 + 开关提示
+    //   /q收尾 开|关  → 切换（默认开；每日 reopenTimes 定时重开，关了忘了开也没关系）
+    //   /q收尾 现在|立即 → 一次性总结（不改开关；queue 语义忙则等）
+    if (head === '/q收尾' || cmd === '收尾' || cmd === '总结') {
+      let wsArg2 = '';
+      let act2 = '';
+      for (const w of rest) {
+        if (/^(开|on)$/i.test(w)) act2 = 'on';
+        else if (/^(关|off)$/i.test(w)) act2 = 'off';
+        else if (/^(现在|立即|一次|now)$/i.test(w)) act2 = 'now';
+        else if (!wsArg2) wsArg2 = w;
+      }
+      const d2 = wsArg2
+        ? await questCall(`/api/status?ws=${encodeURIComponent(wsArg2)}`)
+        : await questCall('/api/status');
+      const wsPath2 = d2?.plan?.workspace;
+      if (!wsPath2) return '收尾失败：找不到工作区（试试 /q收尾 <目录名>）';
+      if (act2 === 'now') {
+        const active = (d2?.line?.active ?? 0);
+        const m = await questCall(`/api/summarize?ws=${encodeURIComponent(wsPath2)}`, { method: 'POST', body: '{}' }, 60000);
+        if (m.ok) return [
+          `一次性总结已排给 ${String(m.sessionId).slice(0, 18)}…（它忙则排队，不打断当前回合）`,
+          m.note || '',
+          active > 0 ? `⚠️ 还有 ${active} 个节点在跑（这是中途总结）——介意就等跑完再发。` : '当前没有在跑的节点（全线已收）。',
+        ].filter(Boolean).join('\n');
+        return `收尾失败：${m.error || 'quest 无响应'}`;
+      }
+      const q = act2 ? await questCall(`/api/converge?ws=${encodeURIComponent(wsPath2)}`, { method: 'POST', body: JSON.stringify({ action: act2 }) }, 15000)
+                     : await questCall(`/api/converge?ws=${encodeURIComponent(wsPath2)}`);
+      if (!q || q.error) return `收尾开关查询失败：${q?.error || 'quest 无响应'}`;
+      return [
+        `自动收尾【${q.auto ? '开 ✅' : '关 ❌'}】${q.auto ? '：全部节点终态+冷却后自动做全局总结；你在场 1 小时内会让位给手动汇报。' : '：全线收敛不再自动总结。'}`,
+        q.reopenTimes?.length ? `每日 ${q.reopenTimes.join('/')} 会自动重开（忘记开了也没关系）。` : '',
+        '用法：/q收尾 开｜关（切换） · /q收尾 现在（一次性总结，不改开关）',
+      ].filter(Boolean).join('\n');
+    }
     // 翻页（flip）：归档该工作区全部会话 + 开新会话并注入 research-state.md 恢复提示。
     // 前台卡死时用户唯一的会话轮转入口；DSH 网关若彻底挂了会超时报错（先用「重启」救 DSH 再翻页）。
     if (head === '/q翻页') {
       // 参数解析（2026-09-10）：短名模糊匹配工作区（键或标题包含即候选）；多候选列出来让用户挑，不瞎猜
+      // 2026-10-27：精确匹配优先——正主名（如 C-...-code_kl）常是残留（_sweep 等）的公共前缀，
+      // 纯子串匹配永远歧义；键完全相等时直接命中，不再列出前缀撞车的候选。
+      // 2026-10-27 二补：映射群内发 /q翻页（不带参数）= 翻本群对应工作区——群的上下文即目标，
+      // 不用打名字（用户明确要的形态）。
       let wsArg = arg1;
+      if (!wsArg && kind === 'group' && cfg.groupWorkspaces && cfg.groupWorkspaces[String(id)]) {
+        const gws = String(cfg.groupWorkspaces[String(id)]);
+        try {
+          const wl2 = await questCall('/api/workspaces');
+          const hit2 = (wl2.workspaces || []).find((w) =>
+            String(w.workspace || '').toLowerCase() === gws.toLowerCase() ||
+            w.wsKey.toLowerCase() === gws.replace(/[:\\\/]+/g, '-').toLowerCase());
+          if (hit2) wsArg = hit2.wsKey;
+        } catch {}
+      }
       if (arg1) {
         const wl = await questCall('/api/workspaces');
         const k = arg1.toLowerCase();
-        const hits = (wl.workspaces || []).filter((w) => w.wsKey.toLowerCase().includes(k) || String(w.title || '').toLowerCase().includes(k));
+        const all = wl.workspaces || [];
+        const exact = all.filter((w) => w.wsKey.toLowerCase() === k);
+        if (exact.length === 1) wsArg = exact[0].wsKey;
+        else {
+        const hits = all.filter((w) => w.wsKey.toLowerCase().includes(k) || String(w.title || '').toLowerCase().includes(k));
         if (hits.length === 1) wsArg = hits[0].wsKey;
         else if (hits.length > 1) return `「${arg1}」匹配到 ${hits.length} 个工作区，说全一点：
 ` + hits.slice(0, 6).map((w) => `- ${w.wsKey}${w.title ? '（' + w.title + '）' : ''}`).join('\n');
+        }
       }
       const d = wsArg ? await questCall(`/api/status?ws=${encodeURIComponent(wsArg)}`) : await questCall('/api/status');
       const wsPath = d?.plan?.workspace;
       if (!wsPath) return `翻页失败：找不到工作区${arg1 ? `「${arg1}」` : '（没有最近活跃的，试试 /q翻页 <目录名>）'}`;
-      const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath }) }, 240000);   // 翻页含"老会话写交接"阶段（最长约 150s），90s 会中途断
+      const f = await questCall('/api/flip', { method: 'POST', body: JSON.stringify({ ws: wsPath, via: 'qq' }) }, 240000);   // 翻页含"老会话写交接"阶段（最长约 150s），90s 会中途断；via:'qq'=翻页闸标记(2026-10-09 AI 自翻页事故后只认 QQ 通道)
       // ⚠️ 成功判定只看 f.ok：f.archived 是数组，空数组 [] 也是 truthy——
       // 2026-09-15 事故：内部全失败仍显示"翻页完成：归档 0 个"的假成功，误导了一整轮排查。
       if (f.ok && f.created) {
@@ -8405,7 +8999,7 @@ async function main() {
         if (cmd && cmd.length <= 12) {
           if (/^(强杀|硬杀)(dsh|deepseek)?$|^杀(dsh|deepseek)$|^kill(\s+dsh)?$/i.test(cmd)) action = 'kill';
           else if (/^(重启|救活|救|硬启)(dsh|deepseek)?$|^restart(\s+dsh)?$/i.test(cmd)) action = 'restart';
-          else if (/^(开|打开)(dsh|deepseek|web|网页)$/i.test(cmd) || /^(web|openweb)$/i.test(cmd)) action = 'web';
+          else if (/^(开|打开)(dsh|deepseek|web|网页)?$/i.test(cmd) || /^(web|openweb)$/i.test(cmd)) action = 'web';
           else if (/^(修复)(dsh|deepseek)?$|^repair(\s+dsh)?$/i.test(cmd)) action = 'repair';
           else if (/^(状态|查状态|看状态|健康检查|health|status)$/i.test(cmd)
                 || /^(查|看|检查|诊断)(dsh|deepseek)$/i.test(cmd)
@@ -8419,12 +9013,92 @@ async function main() {
         }
       }
     } catch (error) { log('远程控制判断出错:', error?.message ?? error); }
+    // 【QQ 模型状态】(2026-10-15): DeepSeek API 免密探测——假 key 打一发, 错误类型即服务状态。
+    // 背景: 官方 API 晚高峰过载("Service is too busy")会让所有 DSH 回合卡在"深度求索中",
+    // 且 status.deepseek.com 子域被墙无法直读。401=网关正常(只是拒绝假 key); 429/503=过载;
+    // 超时/网络错=不可达。无需真实 key, 不碰凭据。
+    try {
+      if (event.user_id === cfg.ownerQQ) {
+        const cmdTextP = await segmentsToText(event.message ?? [], { includeReply: false });
+        const cmdP = String(cmdTextP ?? '').trim();
+        if (/^(模型状态|deepseek状态|DSH卡不卡)$/i.test(cmdP)) {
+          const t0 = Date.now();
+          let verdict = '未知';
+          try {
+            const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: 'Bearer sk-probe-invalid-key' },
+              body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
+              signal: AbortSignal.timeout(12000),
+            });
+            const ms = Date.now() - t0;
+            if (resp.status === 401 || resp.status === 403) verdict = `✅ 服务正常（网关响应 ${ms}ms，鉴权拒绝探测 key 属预期）`;
+            else if (resp.status === 429 || resp.status === 503) verdict = `🔥 过载中（HTTP ${resp.status}，${ms}ms）——DSH 卡"深度求索中"就是这个，等自愈或错峰`;
+            else {
+              const bodyText = await resp.text().catch(() => '');
+              verdict = bodyText.includes('too busy')
+                ? `🔥 过载中（HTTP ${resp.status} + "too busy"，${ms}ms）——官方容量不足，等自愈`
+                : `⚠️ 意外响应 HTTP ${resp.status}（${ms}ms）${bodyText.slice(0, 80)}`;
+            }
+          } catch (e) {
+            verdict = `❌ 网络层不可达（${String(e?.name || e?.message || e).slice(0, 60)}）——本机到 api.deepseek.com 断连，与官方过载不同`;
+          }
+          const reply = `【DeepSeek 模型状态】\n${verdict}\n判定口径: 401=正常 / 429+503+too busy=过载 / 超时=断网。卡"深度求索中"+这里显示过载 ⇒ 等，不是你的基础设施问题。`;
+          try { await bot.sendPrivateMessage(event.user_id, reply); } catch {}
+          return;
+        }
+      }
+    } catch (error) { log('模型状态指令出错:', error?.message ?? error); }
+    // 【QQ 重启桥】(2026-10-10 用户需求): 桥自灭,由 start.bat 守护循环 ~5s 拉起新代码。
+    // 只在守护链下安全(当前生产即此形态);影响面=QQ 收发断 20~30s,quest/DSH/会话/过夜任务无关。
+    try {
+      if (event.user_id === cfg.ownerQQ) {
+        const cmdText0 = await segmentsToText(event.message ?? [], { includeReply: false });
+        const cmd0 = String(cmdText0 ?? '').trim();
+        if (/^(重启桥|桥重启|\/q重启桥|restartbridge)$/i.test(cmd0)) {
+          log('[QQ] owner 触发桥自重启');
+          try {
+            await bot.sendPrivateMessage(event.user_id, '🔄 桥自重启中:QQ 断线约 20~30 秒自动恢复(quest/DSH/过夜任务不受影响,审批看护会重连)。');
+          } catch {}
+          setTimeout(() => process.exit(0), 2500);
+          return;
+        }
+        // 【QQ 重启 quest】(2026-10-10): 桥(提权)杀 3110 → start-quest.bat 守护循环 ~10s 拉起。
+        // 安全闸:有节点在跑时拒绝(NOTES 一之四——杀 quest 会陪葬 Windows 车道子进程)。
+        if (/^(重启quest|quest重启|\/q重启quest|restartquest)$/i.test(cmd0)) {
+          log('[QQ] owner 触发 quest 重启');
+          try {
+            const { exec } = await import('node:child_process');
+            const out = await new Promise((res) => exec('netstat -ano | findstr :3110 | findstr LISTENING', { windowsHide: true }, (e, stdout) => res(String(stdout || ''))));
+            const pid = (out.trim().split(/\s+/).pop() || '').trim();
+            if (!/^\d+$/.test(pid)) {
+              await bot.sendPrivateMessage(event.user_id, '⚠️ 没找到 quest(3110) 进程——它可能没在跑。');
+              return;
+            }
+            exec(`taskkill /PID ${pid} /F`, { windowsHide: true }, () => {});
+            await bot.sendPrivateMessage(event.user_id, `🔄 quest(pid ${pid})已终止,守护循环约 10 秒拉起。⚠️ 若刚才有节点在跑,其 Windows 车道任务会被陪葬——重启前最好先发「状态」确认没有在跑的。`);
+          } catch (e) {
+            try { await bot.sendPrivateMessage(event.user_id, 'quest 重启异常:' + String(e?.message ?? e).slice(0, 100)); } catch {}
+          }
+          return;
+        }
+      }
+    } catch {}
     // 【quest 命令】owner 私聊 / 前缀 → 直连 quest API（零 token、DSH 挂了也能用）
     try {
       if (event.user_id === cfg.ownerQQ) {
         const cmdText = await segmentsToText(event.message ?? [], { includeReply: false });
-        const cmd = String(cmdText ?? '').trim();
-        if (cmd.startsWith('/') || /^(远程网址|网址|令牌|quest令牌)$/.test(cmd)) {
+        let cmd = String(cmdText ?? '').trim();
+        // 裸词归一化（2026-09-20）：状态/总览/晨报 直连 quest，零 token 秒回（DSH 挂了也能用）
+        // 2026-10-09 补"全貌"：此前未注册,走 AI 自由发挥答了个"类总览"——与"状态"并非撞指令,
+        // 是同义词缺口。一并补"看全景/看总览"这类"看X"变体。
+        if (/^(总览|全景|全貌|跨工作区|任务总览|晨报|早报|日报)$/i.test(cmd)
+            || /^(看|查)(全景|全貌|总览)$/.test(cmd)) cmd = '/q总览';
+        else if (/^状态$/i.test(cmd)) cmd = '/q状态';
+        else if (/^取消$/i.test(cmd)) cmd = '/q取消';
+        else if (/^(同意|批准|approve)$/i.test(cmd)) cmd = '/q同意';
+        else if (/^(拒绝|deny|reject)$/i.test(cmd)) cmd = '/q拒绝';
+        if (cmd.startsWith('/') || /^(远程网址|网址|令牌|quest令牌|状态|取消|同意|批准|拒绝|总览|任务总览|全景|全貌|晨报|早报|日报)$/.test(cmd)) {
           const reply = await handleQuestCommand(cmd);
           if (reply !== null) {
             try { await bot.sendPrivateMessage(event.user_id, reply); } catch {}
@@ -8441,6 +9115,19 @@ async function main() {
   });
   bot.onNotice('notify', async (event) => {
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
+    // 2026-10-13 用户消息防抖配套：QQ 撤回——若消息还在防抖缓冲（未投递），直接剔除
+    try {
+      const sub = String(event?.notice_type || event?.sub_type || '');
+      if (sub.includes('recall') && event?.message_id != null) {
+        let removed = false;
+        for (const [k, b] of userDebounceBuf) {
+          const before = b.parts.length;
+          b.parts = b.parts.filter((p) => p.messageId !== event.message_id);
+          if (b.parts.length < before) removed = true;
+        }
+        if (removed) log(`[防抖] 撤回：已从缓冲剔除 message_id=${event.message_id}`);
+      }
+    } catch {}
   });
 
   bot.on('open', () => log(`SnowLuma 已连接：${cfg.snowluma.wsUrl}`));
@@ -8479,6 +9166,14 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 process.on('unhandledRejection', (error) => log('未处理异常:', error?.message ?? error));
+// 2026-09-23 补：同步异常此前无兜底——任何回调里的 sync throw 会无声猝死（日志零记录），
+// 与 09-22 深夜桥整树消失事件的"无痕"形状一致（虽未能定案）。现在：记满栈再 exit(1)，
+// start.bat 守护 5 秒拉起；下次再死，死因会留在 bridge.log 里。
+process.on('uncaughtException', (error) => {
+  log('未捕获异常(同步,进程将退出交守护重启):', error?.stack ?? error?.message ?? error);
+  try { saveState(); } catch {}
+  process.exit(1);
+});
 process.on('exit', () => releaseLock());
 
 main().catch((error) => {

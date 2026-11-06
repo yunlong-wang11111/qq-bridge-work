@@ -11,7 +11,8 @@ node src/bridge.js
 set code=%errorlevel%
 if "%code%"=="2" (
     echo [%date% %time%] bridge already running in another window. Exiting.
-    pause
+    rem 2026-09-19：pause 改 timeout——登录自启任务误触发时不再留僵尸窗口等按键
+    timeout /t 10 /nobreak >nul
     exit /b 2
 )
 echo [%date% %time%] bridge exited (code %code%), restarting in 5 seconds...
